@@ -6,6 +6,8 @@ import (
 	"io"
 )
 
+// TODO: Handle buffer overflow
+
 // A JSON stream lexer that reads JSON objects from a stream and sends them to a channel.
 // Using a small read buffer of 4k bytes + the current unfinished object
 type JsonStreamLexer struct {
@@ -79,6 +81,8 @@ func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
 			if err != nil {
 				if err != io.EOF && err != io.ErrUnexpectedEOF {
 					errorsC <- err
+					// close(objects)
+					// close(errorsC)
 				}
 				break
 			}
