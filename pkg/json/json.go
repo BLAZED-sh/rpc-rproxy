@@ -49,18 +49,31 @@ func NewJsonStreamLexer(
 }
 
 func (l *JsonStreamLexer) Read() (int, error) {
-	// Ensure we have room for at least 4KB more data
+	// // Compact buffer
+	// if l.cursor > 0 {
+	// 	copy(l.buffer, l.buffer[l.cursor:l.length+l.maxRead])
+	// 	l.length -= l.cursor
+	// 	l.cursor = 0
+	// }
+
+	// Ensure we have room for at least maxRead more data
 	bCap := cap(l.buffer)
 	remainingCap := bCap - l.length
-	if remainingCap < 4096 {
-		// Double the capacity
-		newBuffer := make([]byte, bCap*2)
+	minCap := l.length + l.maxRead
+	if remainingCap < minCap {
+		var newCap int
+		if bCap < minCap {
+			newCap = minCap
+		} else {
+			newCap = bCap * 2
+		}
+		newBuffer := make([]byte, newCap)
 		copy(newBuffer, l.buffer)
 		l.buffer = newBuffer
 	}
 
 	// Read into buffer
-	n, err := l.reader.Read(l.buffer[l.length : l.length+4096])
+	n, err := l.reader.Read(l.buffer[l.length : l.length+l.maxRead])
 	if err != nil {
 		return n, err
 	}
@@ -97,22 +110,12 @@ func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
 					break
 				}
 
-				// fmt.Println("start: ", start, "end: ", end)
-				// fmt.Println("buffer: ", string(l.buffer[start]))
-
 				// Object is not finished -> read more and try again
 				if end == -1 {
-					//l.cursor = start
 					break
 				}
 
 				objects <- l.buffer[start : end+1]
-
-				// Remove processed object from buffer
-				// remaining := copy(l.buffer, l.buffer[end:])
-
-				// Remove parsed object from buffer
-				//l.buffer = l.buffer[end+1:]
 
 				if end+1 < l.length {
 					l.cursor = end + 1
@@ -121,11 +124,9 @@ func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
 			}
 
 			// Remove processed object from buffer
-			//newCursor := l.length - l.cursor
 			l.buffer = l.buffer[l.cursor:]
 			l.length -= l.cursor
 			l.cursor = 0
-			//l.cursor = newCursor
 		}
 	}
 }

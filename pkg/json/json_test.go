@@ -231,7 +231,7 @@ func BenchmarkDecodeAll(b *testing.B) {
 			generator: func() string {
 				return `{"id": 1, "name": "test", "value": 123.45}`
 			},
-			size: 100,
+			size: 700,
 		},
 		{
 			name: "medium array",
@@ -277,9 +277,7 @@ func BenchmarkDecodeAll(b *testing.B) {
 			}
 			input := fullInput.String()
 			inputSize := len(input)
-
-			// Reset the timer before the actual benchmark
-			b.ResetTimer()
+			b.Logf("input size: %d", inputSize)
 
 			// Set the bytes count for throughput calculation
 			b.SetBytes(int64(inputSize))
@@ -287,9 +285,15 @@ func BenchmarkDecodeAll(b *testing.B) {
 			objectsC := make(chan []byte)
 			errorsC := make(chan error)
 
+			// Reset the timer before the actual benchmark
+			b.ResetTimer()
+
 			// Run the benchmark N times
 			for i := 0; i < b.N; i++ {
+				b.StopTimer()
 				reader := bytes.NewReader([]byte(input))
+				b.StartTimer()
+
 				lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096)
 
 				// done := make(chan struct{})
@@ -298,13 +302,19 @@ func BenchmarkDecodeAll(b *testing.B) {
 				// 	done <- struct{}{}
 				// }()
 
+				//go
 				go lexer.DecodeAll(objectsC, errorsC)
 
 				var totalBytes int
-				for obj := range objectsC {
-					totalBytes += len(obj)
-					if totalBytes >= inputSize {
-						break
+				for totalBytes < inputSize {
+					select {
+					case err := <-errorsC:
+						b.Fatal("unexpected error:", err)
+					case obj, ok := <-objectsC:
+						if !ok { // channel closed
+							b.Fatal("objects channel closed before receiving all data")
+						}
+						totalBytes += len(obj)
 					}
 				}
 
