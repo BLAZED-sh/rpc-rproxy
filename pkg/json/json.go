@@ -84,7 +84,8 @@ func (l *JsonStreamLexer) Read() (int, error) {
 	return n, nil
 }
 
-func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
+// func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
+func (l *JsonStreamLexer) DecodeAll(cb func([]byte)) {
 	for {
 		select {
 		case <-l.context.Done():
@@ -93,7 +94,7 @@ func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
 			_, err := l.Read()
 			if err != nil {
 				if err != io.EOF && err != io.ErrUnexpectedEOF {
-					errorsC <- err
+					// errorsC <- err
 					// close(objects)
 					// close(errorsC)
 				}
@@ -106,7 +107,7 @@ func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
 				if err != nil {
 					l.length = 0
 					l.cursor = 0
-					errorsC <- err
+					// errorsC <- err
 					break
 				}
 
@@ -115,7 +116,8 @@ func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
 					break
 				}
 
-				objects <- l.buffer[start : end+1]
+				// objects <- l.buffer[start : end+1]
+				cb(l.buffer[start : end+1])
 
 				if end+1 < l.length {
 					l.cursor = end + 1
