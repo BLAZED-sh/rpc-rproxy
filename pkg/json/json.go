@@ -6,16 +6,16 @@ import (
 	"io"
 )
 
-// TODO: Handle buffer overflow
-
-// A JSON stream lexer that reads JSON objects from a stream and sends them to a channel.
-// Using a small read buffer of 4k bytes + the current unfinished object
+// JsonStreamLexer is a streaming JSON lexer/seperator that reads JSON objects and arrays from an io.Reader.
+// It is designed to be used in a streaming context where the input is a continuous stream of JSON objects
+// like a JSONL file or a JSON RPC connection.
+// This 'lexer' is actually more of a JSON object seperator that keeps track of the start and end of objects and arrays
+// to split the input stream into individual parts that can be parsed by a real JSON decoder.
 type JsonStreamLexer struct {
 	reader  io.Reader
 	context context.Context
 	maxRead int
 
-	// Internal buffer management
 	buffer []byte
 	cursor int // Points to beginning of next json object
 	length int // Number of bytes used in buffer
@@ -27,6 +27,7 @@ type JsonStreamLexer struct {
 	maxObjectLength int
 }
 
+// Create a new JsonStreamLexer with the given reader and buffer size.
 func NewJsonStreamLexer(
 	context context.Context,
 	reader io.Reader,
@@ -49,13 +50,6 @@ func NewJsonStreamLexer(
 }
 
 func (l *JsonStreamLexer) Read() (int, error) {
-	// // Compact buffer
-	// if l.cursor > 0 {
-	// 	copy(l.buffer, l.buffer[l.cursor:l.length+l.maxRead])
-	// 	l.length -= l.cursor
-	// 	l.cursor = 0
-	// }
-
 	// Ensure we have room for at least maxRead more data
 	bCap := cap(l.buffer)
 	remainingCap := bCap - l.length
@@ -84,60 +78,42 @@ func (l *JsonStreamLexer) Read() (int, error) {
 	return n, nil
 }
 
-// func (l *JsonStreamLexer) DecodeAll(objects chan []byte, errorsC chan error) {
-func (l *JsonStreamLexer) DecodeAll(cb func([]byte)) {
+func (l *JsonStreamLexer) DecodeAll(cb func([]byte), errCb func(error)) {
 	for {
 		select {
 		case <-l.context.Done():
 			return
 		default:
-			_, err := l.Read()
-			if err != nil {
-				if err != io.EOF && err != io.ErrUnexpectedEOF {
-					// errorsC <- err
-					// close(objects)
-					// close(errorsC)
-				}
-				break
+			n, err := l.Read()
+
+			if err == io.EOF {
+				l.processBuffer(cb, errCb)
+				return
 			}
 
-			for {
-				// Process objects
-				start, end, err := l.NextObject()
-				if err != nil {
-					l.length = 0
-					l.cursor = 0
-					// errorsC <- err
-					break
-				}
-
-				// Object is not finished -> read more and try again
-				if end == -1 {
-					break
-				}
-
-				// objects <- l.buffer[start : end+1]
-				cb(l.buffer[start : end+1])
-
-				if end+1 < l.length {
-					l.cursor = end + 1
-				}
-
+			// Exit on real errors
+			if err != nil && err != io.ErrUnexpectedEOF {
+				errCb(err)
+				return
 			}
 
-			// Remove processed object from buffer
-			l.buffer = l.buffer[l.cursor:]
-			l.length -= l.cursor
-			l.cursor = 0
+			if n == 0 && err == io.ErrUnexpectedEOF {
+				continue // Try reading again if we need more data
+			}
+
+			// Process available objects and continue if we need more data
+			if complete := l.processBuffer(cb, errCb); complete {
+				return
+			}
 		}
 	}
 }
 
 func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
-	objectDepth := 0
-	arrayDepth := 0
 	inString := false
 	escaped := false
+	objectDepth := 0
+	arrayDepth := 0
 	stringLength := 0
 	arrayLength := 0
 	objectLength := 0
@@ -229,4 +205,29 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 
 	// Object is not complete
 	return start, -1, nil
+}
+
+// processBuffer processes complete objects in the buffer and calls the callback for each
+func (l *JsonStreamLexer) processBuffer(cb func([]byte), errCb func(err error)) (complete bool) {
+	for l.length > 0 {
+		start, end, err := l.NextObject()
+		if err != nil {
+			errCb(err)
+			return true // Exit on parsing errors
+		}
+		if end == -1 {
+			return false // Need more data
+		}
+
+		cb(l.buffer[start : end+1])
+		l.cursor = end + 1
+
+		// Compact buffer after each object
+		if l.cursor > 0 {
+			copy(l.buffer, l.buffer[l.cursor:l.length])
+			l.length -= l.cursor
+			l.cursor = 0
+		}
+	}
+	return true
 }
