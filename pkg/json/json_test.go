@@ -80,7 +80,7 @@ func TestNextObjectErrors(t *testing.T) {
 	testCases := []struct {
 		name     string
 		input    string
-		maxDepth int
+		maxDepth uint8
 		wantErr  string
 	}{
 		{

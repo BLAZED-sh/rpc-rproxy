@@ -21,10 +21,10 @@ type JsonStreamLexer struct {
 	length int // Number of bytes used in buffer
 
 	// Parsing policy
-	maxDepth        int
-	maxStringLength int
-	maxArrayLength  int
-	maxObjectLength int
+	maxDepth        uint8
+	maxStringLength uint16
+	maxArrayLength  uint16
+	maxObjectLength uint16
 }
 
 // Create a new JsonStreamLexer with the given reader and buffer size.
@@ -109,66 +109,99 @@ func (l *JsonStreamLexer) DecodeAll(cb func([]byte), errCb func(error)) {
 	}
 }
 
+// Pre-computed lookup tables for character classification
+var (
+	isWhitespace [256]bool
+	isStructural [256]bool
+)
+
+func init() {
+	// Initialize lookup tables
+	isWhitespace[' '], isWhitespace['\n'], isWhitespace['\r'], isWhitespace['\t'] = true, true, true, true
+	isStructural['{'], isStructural['}'], isStructural['['], isStructural[']'], isStructural['"'] = true, true, true, true, true
+}
+
 func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
-	inString := false
-	escaped := false
-	objectDepth := 0
-	arrayDepth := 0
-	stringLength := 0
-	arrayLength := 0
-	objectLength := 0
+	const (
+		stateInString = 1 << iota
+		stateEscaped
+	)
+	var state uint8
+
+	// Use uint8 for depths since JSON rarely nests deeply
+	var (
+		objectDepth  uint8
+		arrayDepth   uint8
+		stringLength uint16
+		arrayLength  uint16
+		objectLength uint16
+	)
 
 	// Find start of object/array
-	for start = l.cursor; start < l.length; start++ {
-		c := l.buffer[start]
+	buf := l.buffer[l.cursor:l.length]
+	for i := 0; i < len(buf); i++ {
+		c := buf[i]
 		if c == '{' || c == '[' {
-			break
+			start = l.cursor + i
+			goto parseLoop
 		}
 		if c == '}' || c == ']' {
-			return 0, 0, fmt.Errorf("invalid JSON: unmatched closing bracket at position %d", start)
+			return 0, 0, fmt.Errorf(
+				"invalid JSON: unmatched closing bracket at position %d",
+				l.cursor+i,
+			)
 		}
-		if c != ' ' && c != '\n' && c != 0 {
+		if !isWhitespace[c] {
 			return 0, 0, fmt.Errorf(
 				"invalid JSON: unexpected character '%c' at position %d",
 				c,
-				start,
+				l.cursor+i,
 			)
 		}
 	}
+	return l.cursor, -1, nil
 
-	for i := start; i < l.length; i++ {
-		c := l.buffer[i]
+parseLoop:
+	buf = l.buffer[start:l.length]
+	for i := 0; i < len(buf); i++ {
+		c := buf[i]
 
-		if inString {
+		if state&stateInString != 0 {
 			stringLength++
 			if stringLength > l.maxStringLength {
 				return 0, 0, fmt.Errorf("string exceeds maximum length of %d", l.maxStringLength)
 			}
 
-			if escaped {
-				escaped = false
+			if state&stateEscaped != 0 {
+				state &^= stateEscaped
 				continue
 			}
 
-			switch c {
-			case '\\':
-				escaped = true
-			case '"':
-				inString = false
+			if c == '\\' {
+				state |= stateEscaped
+				continue
+			}
+			if c == '"' {
+				state &^= stateInString
 				stringLength = 0
 			}
 			continue
 		}
 
+		// Fast path for non-structural characters
+		if !isStructural[c] {
+			continue
+		}
+
 		switch c {
 		case '"':
-			inString = true
+			state |= stateInString
 		case '{':
 			objectDepth++
 			if objectDepth > l.maxDepth {
 				return 0, 0, fmt.Errorf("object exceeds maximum depth of %d", l.maxDepth)
 			}
-			// Only count root-level objects
+
 			if objectDepth == 1 && arrayDepth == 0 {
 				objectLength++
 				if objectLength > l.maxObjectLength {
@@ -185,25 +218,30 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 				return 0, 0, fmt.Errorf("array length exceeds maximum of %d", l.maxArrayLength)
 			}
 		case '}':
-			objectDepth--
-			if objectDepth < 0 {
-				return 0, 0, fmt.Errorf("invalid JSON: unmatched closing bracket at position %d", i)
+			if objectDepth == 0 {
+				return 0, 0, fmt.Errorf(
+					"invalid JSON: unmatched closing bracket at position %d",
+					start+i,
+				)
 			}
+			objectDepth--
 			if objectDepth == 0 && arrayDepth == 0 {
-				return start, i, nil
+				return start, start + i, nil
 			}
 		case ']':
-			arrayDepth--
-			if arrayDepth < 0 {
-				return 0, 0, fmt.Errorf("invalid JSON: unmatched closing bracket at position %d", i)
+			if arrayDepth == 0 {
+				return 0, 0, fmt.Errorf(
+					"invalid JSON: unmatched closing bracket at position %d",
+					start+i,
+				)
 			}
+			arrayDepth--
 			if objectDepth == 0 && arrayDepth == 0 {
-				return start, i, nil
+				return start, start + i, nil
 			}
 		}
 	}
 
-	// Object is not complete
 	return start, -1, nil
 }
 
