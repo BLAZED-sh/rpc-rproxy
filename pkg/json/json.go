@@ -109,134 +109,114 @@ func (l *JsonStreamLexer) DecodeAll(cb func([]byte), errCb func(error)) {
 	}
 }
 
-// Pre-computed lookup tables for character classification
-var (
-	isWhitespace [256]bool
-	isStructural [256]bool
-)
-
-func init() {
-	// Initialize lookup tables
-	isWhitespace[' '], isWhitespace['\n'], isWhitespace['\r'], isWhitespace['\t'] = true, true, true, true
-	isStructural['{'], isStructural['}'], isStructural['['], isStructural[']'], isStructural['"'] = true, true, true, true, true
+type parseState struct {
+	objectDepth  uint8
+	arrayDepth   uint8
+	stringLength uint16
+	arrayLength  uint16
+	objectLength uint16
+	maxDepth     uint8
+	maxArrayLen  uint16
+	maxObjectLen uint16
+	maxStringLen uint16
 }
 
 func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
-	const (
-		stateInString = 1 << iota
-		stateEscaped
-	)
 	var state uint8
-
-	// Use uint8 for depths since JSON rarely nests deeply
-	var (
-		objectDepth  uint8
-		arrayDepth   uint8
-		stringLength uint16
-		arrayLength  uint16
-		objectLength uint16
-	)
+	ps := parseState{
+		maxDepth:     l.maxDepth,
+		maxArrayLen:  l.maxArrayLength,
+		maxObjectLen: l.maxObjectLength,
+		maxStringLen: l.maxStringLength,
+	}
 
 	// Find start of object/array
 	buf := l.buffer[l.cursor:l.length]
-	for i := 0; i < len(buf); i++ {
-		c := buf[i]
-		if c == '{' || c == '[' {
-			start = l.cursor + i
-			goto parseLoop
-		}
-		if c == '}' || c == ']' {
-			return 0, 0, fmt.Errorf(
-				"invalid JSON: unmatched closing bracket at position %d",
-				l.cursor+i,
-			)
-		}
-		if !isWhitespace[c] {
-			return 0, 0, fmt.Errorf(
-				"invalid JSON: unexpected character '%c' at position %d",
-				c,
-				l.cursor+i,
-			)
-		}
+	offset, err := skipWhitespace(buf)
+	if err != nil {
+		return 0, 0, err
 	}
-	return l.cursor, -1, nil
+	if offset == len(buf) {
+		return l.cursor, -1, nil
+	}
 
-parseLoop:
+	start = l.cursor + offset
+	if buf[offset] != '{' && buf[offset] != '[' {
+		return 0, 0, fmt.Errorf(
+			"invalid JSON: unexpected character '%c' at position %d",
+			buf[offset],
+			start,
+		)
+	}
+
 	buf = l.buffer[start:l.length]
-	for i := 0; i < len(buf); i++ {
-		c := buf[i]
-
+	for i := 0; i < len(buf); {
 		if state&stateInString != 0 {
-			stringLength++
-			if stringLength > l.maxStringLength {
-				return 0, 0, fmt.Errorf("string exceeds maximum length of %d", l.maxStringLength)
+			endOffset, escaped, err := scanString(buf[i:], ps.maxStringLen)
+			if err != nil {
+				return 0, 0, err
 			}
-
-			if state&stateEscaped != 0 {
-				state &^= stateEscaped
-				continue
+			if endOffset == -1 {
+				return start, -1, nil // Need more data
 			}
-
-			if c == '\\' {
+			i += endOffset
+			if escaped {
 				state |= stateEscaped
-				continue
-			}
-			if c == '"' {
+			} else {
 				state &^= stateInString
-				stringLength = 0
 			}
 			continue
 		}
 
-		// Fast path for non-structural characters
-		if !isStructural[c] {
-			continue
+		structOffset, char := findStructuralChar(buf[i:])
+		if structOffset == -1 {
+			return start, -1, nil // Need more data
 		}
+		i += structOffset
 
-		switch c {
+		switch char {
 		case '"':
 			state |= stateInString
 		case '{':
-			objectDepth++
-			if objectDepth > l.maxDepth {
-				return 0, 0, fmt.Errorf("object exceeds maximum depth of %d", l.maxDepth)
+			ps.objectDepth++
+			if ps.objectDepth > ps.maxDepth {
+				return 0, 0, fmt.Errorf("object exceeds maximum depth of %d", ps.maxDepth)
 			}
-
-			if objectDepth == 1 && arrayDepth == 0 {
-				objectLength++
-				if objectLength > l.maxObjectLength {
-					return 0, 0, fmt.Errorf("object count exceeds maximum of %d", l.maxObjectLength)
+			if ps.objectDepth == 1 && ps.arrayDepth == 0 {
+				ps.objectLength++
+				if ps.objectLength > ps.maxObjectLen {
+					return 0, 0, fmt.Errorf("object count exceeds maximum of %d", ps.maxObjectLen)
 				}
 			}
 		case '[':
-			arrayDepth++
-			if arrayDepth > l.maxDepth {
-				return 0, 0, fmt.Errorf("array exceeds maximum depth of %d", l.maxDepth)
+			ps.arrayDepth++
+			if ps.arrayDepth > ps.maxDepth {
+				return 0, 0, fmt.Errorf("array exceeds maximum depth of %d", ps.maxDepth)
 			}
-			arrayLength++
-			if arrayLength > l.maxArrayLength {
-				return 0, 0, fmt.Errorf("array length exceeds maximum of %d", l.maxArrayLength)
+			ps.arrayLength++
+			if ps.arrayLength > ps.maxArrayLen {
+				return 0, 0, fmt.Errorf("array length exceeds maximum of %d", ps.maxArrayLen)
 			}
 		case '}':
-			if objectDepth == 0 {
+			if ps.objectDepth == 0 {
 				return 0, 0, fmt.Errorf(
 					"invalid JSON: unmatched closing bracket at position %d",
 					start+i,
 				)
 			}
-			objectDepth--
-			if objectDepth == 0 && arrayDepth == 0 {
+			ps.objectDepth--
+			if ps.objectDepth == 0 && ps.arrayDepth == 0 {
 				return start, start + i, nil
 			}
 		case ']':
-			if arrayDepth == 0 {
+			if ps.arrayDepth == 0 {
 				return 0, 0, fmt.Errorf(
 					"invalid JSON: unmatched closing bracket at position %d",
 					start+i,
 				)
 			}
-			arrayDepth--
-			if objectDepth == 0 && arrayDepth == 0 {
+			ps.arrayDepth--
+			if ps.objectDepth == 0 && ps.arrayDepth == 0 {
 				return start, start + i, nil
 			}
 		}
