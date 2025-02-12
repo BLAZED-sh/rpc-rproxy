@@ -6,21 +6,17 @@ Under Development
   
   
 ### TODO
-  - [ ] Reverse Proxy
-    - [ ] Unix Domain Socket
+  - [x] Reverse Proxy
+    - [x] Unix Domain Socket
     - [ ] HTTP
   - [ ] Session Handling
     - [ ] One to one mode
     - [ ] Pooled mode
-    - [ ] Single upstream
+    - [x] Single upstream
     - [ ] Graceful disconnects
     - [ ] Reconnects
         - [ ] Pub/Sub Replay
-    - [ ] Parsing
-        - [ ] Buffered
+    - [x] Parsing
+        - [x] Buffered
         - [ ] Instant/Blocking
     - [ ] SQLite Logs
-    - [ ] Addons
-        - [ ] Golang Plugins
-        - [ ] Scripting: Lua or JS
-
