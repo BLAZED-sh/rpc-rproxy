@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,7 +18,8 @@ import (
 
 // Helper function to create temporary Unix socket path
 func getTempSocketPath() string {
-	return filepath.Join(os.TempDir(), fmt.Sprintf("test-socket-%d.sock", time.Now().UnixNano()))
+	rndString := fmt.Sprintf("%06x", rand.Intn(0xffffff))
+	return filepath.Join(os.TempDir(), fmt.Sprintf("test-socket-%d-%s.sock", time.Now().UnixNano(), rndString))
 }
 
 func TestNewUnixUpstreamJsonRpcProxy(t *testing.T) {
@@ -49,8 +53,7 @@ func TestListen(t *testing.T) {
 	err := proxy.AddUnixSocketListener(context.Background(), listenerPath)
 	assert.NoError(t, err)
 
-	err = proxy.Listen()
-	assert.NoError(t, err)
+	proxy.Listen()
 	assert.True(t, proxy.listening)
 
 	// Cleanup
@@ -74,8 +77,7 @@ func TestIntegrationJsonRpcProxy(t *testing.T) {
 	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket)
 	err = proxy.AddUnixSocketListener(context.Background(), proxySocket)
 	assert.NoError(t, err)
-	err = proxy.Listen()
-	assert.NoError(t, err)
+	proxy.Listen()
 
 	// Handle mock upstream connections
 	go func() {
@@ -156,12 +158,19 @@ func handleBenchmarkNode(conn net.Conn, responseTemplate []byte) {
 	buffer := make([]byte, 4096)
 
 	for {
-		_, err := conn.Read(buffer)
+		n, err := conn.Read(buffer)
 		if err != nil {
+			fmt.Println(err)
 			return
 		}
+		if n == 0 {
+			fmt.Println("n == 0")
+			return
+		}
+
 		_, err = conn.Write(responseTemplate)
 		if err != nil {
+			fmt.Println(err)
 			return
 		}
 	}
@@ -191,24 +200,24 @@ func getMockResponse(method string, id interface{}) []byte {
 			"id":      id,
 			"result": map[string]interface{}{
 				"number":           "0x1234",
-				"hash":            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"parentHash":      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"nonce":           "0x1234567890abcdef",
-				"sha3Uncles":      "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"logsBloom":       "0x00000000000000000000000000000000",
+				"hash":             "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				"parentHash":       "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				"nonce":            "0x1234567890abcdef",
+				"sha3Uncles":       "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				"logsBloom":        "0x00000000000000000000000000000000",
 				"transactionsRoot": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"stateRoot":       "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"receiptsRoot":    "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-				"miner":           "0x1234567890123456789012345678901234567890",
-				"difficulty":      "0x1234",
-				"totalDifficulty": "0x1234",
-				"extraData":       "0x1234567890abcdef",
-				"size":           "0x1234",
-				"gasLimit":       "0x1234",
-				"gasUsed":        "0x1234",
-				"timestamp":      "0x1234",
-				"transactions":   []string{},
-				"uncles":        []string{},
+				"stateRoot":        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				"receiptsRoot":     "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+				"miner":            "0x1234567890123456789012345678901234567890",
+				"difficulty":       "0x1234",
+				"totalDifficulty":  "0x1234",
+				"extraData":        "0x1234567890abcdef",
+				"size":             "0x1234",
+				"gasLimit":         "0x1234",
+				"gasUsed":          "0x1234",
+				"timestamp":        "0x1234",
+				"transactions":     []string{},
+				"uncles":           []string{},
 			},
 		}
 	}
@@ -217,114 +226,194 @@ func getMockResponse(method string, id interface{}) []byte {
 	return append(responseBytes, '\n')
 }
 
-func BenchmarkProxy(b *testing.B) {
+// setupBenchmark creates all the necessary mock infrastructure for benchmarking
+func setupBenchmark(b *testing.B, method string, concurrency int) ([]net.Conn, []byte, []byte, func()) {
+	b.Helper()
+	// Setup mock node
+	upstreamSocket := getTempSocketPath()
+	upstreamListener, err := net.Listen("unix", upstreamSocket)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	// Setup response template
+	responseTemplate := getMockResponse(method, 1)
+
+	clientsN := concurrency * runtime.GOMAXPROCS(0)
+
+	// Handle mock node connections
+	go func() {
+		for {
+			conn, err := upstreamListener.Accept()
+			if err != nil {
+				// TODO: improve this!
+				if strings.HasSuffix(err.Error(), "use of closed network connection") {
+					break
+				}
+
+				b.Logf("Error accepting connection: %v", err)
+			}
+			go handleBenchmarkNode(conn, responseTemplate)
+		}
+	}()
+
+	// Setup proxy
+	proxySocket := getTempSocketPath()
+	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket)
+	err = proxy.AddUnixSocketListener(context.Background(), proxySocket)
+	if err != nil {
+		b.Fatal(err)
+	}
+	proxy.Listen()
+
+	// Prepare request template
+	request := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  method,
+		"params":  []interface{}{},
+		"id":      1,
+	}
+	if method == "eth_getBalance" {
+		request["params"] = []interface{}{"0x1234567890123456789012345678901234567890", "latest"}
+	} else if method == "eth_getBlockByNumber" {
+		request["params"] = []interface{}{"latest", true}
+	}
+
+	requestBytes, _ := json.Marshal(request)
+	requestBytes = append(requestBytes, '\n')
+
+	// Create a connection pool
+	clients := make([]net.Conn, clientsN)
+	for i := 0; i < clientsN; i++ {
+		client, err := net.Dial("unix", proxySocket)
+		if err != nil {
+			b.Fatal(err)
+		}
+		clients[i] = client
+	}
+
+	cleanup := func() {
+		for _, client := range clients {
+			client.Close()
+		}
+		upstreamListener.Close()
+		os.Remove(upstreamSocket)
+		os.Remove(proxySocket)
+		//b.Logf("cleanup done")
+	}
+
+	return clients, requestBytes, responseTemplate, cleanup
+}
+
+func BenchmarkProxyLinear(b *testing.B) {
 	benchmarks := []struct {
-		name         string
-		method       string
-		concurrency  int
-		messageCount int
+		name   string
+		method string
 	}{
-		{"BlockNumber_Single", "eth_blockNumber", 1, 1000},
-		{"BlockNumber_Concurrent10", "eth_blockNumber", 10, 1000},
-		{"BlockNumber_Concurrent100", "eth_blockNumber", 100, 1000},
-		{"GetBalance_Single", "eth_getBalance", 1, 1000},
-		{"GetBalance_Concurrent10", "eth_getBalance", 10, 1000},
-		{"GetBlock_Single", "eth_getBlockByNumber", 1, 1000},
-		{"GetBlock_Concurrent10", "eth_getBlockByNumber", 10, 1000},
+		{"BlockNumber", "eth_blockNumber"},
+		{"GetBalance", "eth_getBalance"},
+		{"GetBlock", "eth_getBlockByNumber"},
 	}
 
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
-			// Setup mock node
-			upstreamSocket := getTempSocketPath()
-			upstreamListener, err := net.Listen("unix", upstreamSocket)
-			if err != nil {
-				b.Fatal(err)
-			}
-			defer upstreamListener.Close()
-			defer os.Remove(upstreamSocket)
+			b.StopTimer()
+			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, 1)
+			defer cleanup()
 
-			// Setup response template
-			responseTemplate := getMockResponse(bm.method, 1)
+			response := make([]byte, 4096)
+			client := clients[0]
 
-			// Handle mock node connections
-			go func() {
-				for {
-					conn, err := upstreamListener.Accept()
-					if err != nil {
-						return
-					}
-					go handleBenchmarkNode(conn, responseTemplate)
+			b.SetBytes(int64(len(requestBytes) + len(responseTemplate)))
+			b.StartTimer()
+
+			for i := 0; i < b.N; i++ {
+				if _, err := client.Write(requestBytes); err != nil {
+					b.Fatal(err)
 				}
-			}()
 
-			// Setup proxy
-			proxySocket := getTempSocketPath()
-			defer os.Remove(proxySocket)
-
-			proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket)
-			err = proxy.AddUnixSocketListener(context.Background(), proxySocket)
-			if err != nil {
-				b.Fatal(err)
-			}
-			err = proxy.Listen()
-			if err != nil {
-				b.Fatal(err)
-			}
-
-			// Prepare request template
-			request := map[string]interface{}{
-				"jsonrpc": "2.0",
-				"method":  bm.method,
-				"params":  []interface{}{},
-				"id":      1,
-			}
-			if bm.method == "eth_getBalance" {
-				request["params"] = []interface{}{"0x1234567890123456789012345678901234567890", "latest"}
-			} else if bm.method == "eth_getBlockByNumber" {
-				request["params"] = []interface{}{"latest", true}
-			}
-
-			requestBytes, _ := json.Marshal(request)
-			requestBytes = append(requestBytes, '\n')
-
-			// Reset timer before the actual benchmark
-			b.ResetTimer()
-
-			// Run concurrent clients
-			done := make(chan bool)
-			for c := 0; c < bm.concurrency; c++ {
-				go func() {
-					client, err := net.Dial("unix", proxySocket)
-					if err != nil {
-						b.Error(err)
-						return
-					}
-					defer client.Close()
-
-					response := make([]byte, 4096)
-					for i := 0; i < bm.messageCount; i++ {
-						_, err = client.Write(requestBytes)
-						if err != nil {
-							b.Error(err)
-							return
-						}
-
-						_, err = client.Read(response)
-						if err != nil {
-							b.Error(err)
-							return
-						}
-					}
-					done <- true
-				}()
-			}
-
-			// Wait for all goroutines to complete
-			for i := 0; i < bm.concurrency; i++ {
-				<-done
+				if _, err := client.Read(response); err != nil {
+					b.Fatal(err)
+				}
 			}
 		})
 	}
 }
 
+func BenchmarkProxyConcurrent(b *testing.B) {
+	benchmarks := []struct {
+		name        string
+		method      string
+		concurrency int
+	}{
+		{"BlockNumber_10", "eth_blockNumber", 10},
+		{"BlockNumber_100", "eth_blockNumber", 100},
+		{"GetBalance_10", "eth_getBalance", 10},
+		{"GetBlock_10", "eth_getBlockByNumber", 10},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.StopTimer()
+
+			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, bm.concurrency)
+			defer cleanup()
+
+			// Create a buffered channel to distribute client connections
+			clientsN := bm.concurrency * runtime.GOMAXPROCS(0)
+			clientChan := make(chan net.Conn, clientsN)
+			doneChan := make(chan struct{}, clientsN)
+
+			for _, client := range clients {
+				clientChan <- client
+			}
+
+			b.SetBytes(int64(len(requestBytes) + len(responseTemplate)))
+			b.SetParallelism(bm.concurrency)
+			b.StartTimer()
+
+			b.RunParallel(func(pb *testing.PB) {
+				//b.Logf("bench job start")
+
+				// Get a dedicated client connection for this goroutine
+				var client net.Conn
+				select {
+				case client = <-clientChan:
+				default:
+					b.Fatal("No client available")
+				}
+				response := make([]byte, 4096)
+
+				for pb.Next() {
+					//b.Logf("pb.Next()")
+					if _, err := client.Write(requestBytes); err != nil {
+						b.Error(err)
+						break
+					}
+					//b.Logf("client.Wrote")
+
+					_, err := client.Read(response)
+					if err != nil {
+						b.Error(err)
+						break
+					}
+					//b.Log("client.Read")
+				}
+
+				//client.Close()
+				//b.Logf("bench job done")
+
+				// Signal that we're done with this client
+				doneChan <- struct{}{}
+			})
+
+			//b.Logf("job done. waiting for clients...")
+
+			//Wait for all clients to finish
+			for i := 0; i < clientsN; i++ {
+				<-doneChan
+				//b.Logf("done %d/%d", i+1, clientsN)
+			}
+		})
+	}
+}

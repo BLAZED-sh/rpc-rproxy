@@ -18,7 +18,7 @@ func (u *Upstream) RefillPool() error {
 	}
 
 	for i := 0; i < diff; i++ {
-		conn, err := u.dial()
+		conn, err := u.NewConn()
 		if err != nil {
 			return err
 		}
@@ -30,7 +30,7 @@ func (u *Upstream) RefillPool() error {
 }
 
 // Return a random upstream from pool
-func (u *Upstream) Conn() (net.Conn, error) {
+func (u *Upstream) PooledConn() (net.Conn, error) {
 	err := u.RefillPool()
 	if err != nil {
 		return nil, err
@@ -42,4 +42,8 @@ func (u *Upstream) Conn() (net.Conn, error) {
 
 	i := rand.Intn(len(u.pool))
 	return u.pool[i], nil
+}
+
+func (u *Upstream) NewConn() (net.Conn, error) {
+	return u.dial()
 }
