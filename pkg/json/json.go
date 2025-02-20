@@ -257,7 +257,12 @@ func (l *JsonStreamLexer) processBuffer(cb func([]byte), errCb func(err error)) 
 			return false // Need more data
 		}
 
+		// TODO: check if this is smart
+		// data := make([]byte, end-start+1)
+		// copy(data, l.buffer[start:end+1])
+
 		cb(l.buffer[start : end+1])
+		//cb(data)
 		l.cursor = end + 1
 
 		// Compact buffer after each object

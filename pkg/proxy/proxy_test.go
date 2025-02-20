@@ -81,13 +81,11 @@ func TestIntegrationJsonRpcProxy(t *testing.T) {
 
 	// Handle mock upstream connections
 	go func() {
-		for {
-			conn, err := upstreamListener.Accept()
-			if err != nil {
-				return
-			}
-			go handleMockEthNode(t, conn)
+		conn, err := upstreamListener.Accept()
+		if err != nil {
+			return
 		}
+		handleMockEthNode(t, conn)
 	}()
 
 	// Test client connection and JSON-RPC communication
@@ -227,7 +225,7 @@ func getMockResponse(method string, id interface{}) []byte {
 }
 
 // setupBenchmark creates all the necessary mock infrastructure for benchmarking
-func setupBenchmark(b *testing.B, method string, concurrency int) ([]net.Conn, []byte, []byte, func()) {
+func setupBenchmark(b *testing.B, method string, concurrency, cpu int) ([]net.Conn, []byte, []byte, func()) {
 	b.Helper()
 	// Setup mock node
 	upstreamSocket := getTempSocketPath()
@@ -239,7 +237,7 @@ func setupBenchmark(b *testing.B, method string, concurrency int) ([]net.Conn, [
 	// Setup response template
 	responseTemplate := getMockResponse(method, 1)
 
-	clientsN := concurrency * runtime.GOMAXPROCS(0)
+	clientsN := concurrency * cpu
 
 	// Handle mock node connections
 	go func() {
@@ -299,7 +297,7 @@ func setupBenchmark(b *testing.B, method string, concurrency int) ([]net.Conn, [
 		upstreamListener.Close()
 		os.Remove(upstreamSocket)
 		os.Remove(proxySocket)
-		//b.Logf("cleanup done")
+		//b.Log("cleanup done")
 	}
 
 	return clients, requestBytes, responseTemplate, cleanup
@@ -318,22 +316,30 @@ func BenchmarkProxyLinear(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			b.StopTimer()
-			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, 1)
+			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, 1, 1)
 			defer cleanup()
 
-			response := make([]byte, 4096)
 			client := clients[0]
+			response := make([]byte, 4096)
+			expectedResponseSize := len(responseTemplate)
 
-			b.SetBytes(int64(len(requestBytes) + len(responseTemplate)))
+			b.SetBytes(int64(len(requestBytes) + expectedResponseSize))
 			b.StartTimer()
 
 			for i := 0; i < b.N; i++ {
+				// Write request
 				if _, err := client.Write(requestBytes); err != nil {
 					b.Fatal(err)
 				}
 
-				if _, err := client.Read(response); err != nil {
-					b.Fatal(err)
+				// Read response
+				bytesRead := 0
+				for bytesRead < expectedResponseSize {
+					n, err := client.Read(response[bytesRead:])
+					if err != nil {
+						b.Fatal(err)
+					}
+					bytesRead += n
 				}
 			}
 		})
@@ -356,11 +362,12 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 		b.Run(bm.name, func(b *testing.B) {
 			b.StopTimer()
 
-			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, bm.concurrency)
+			cpu := runtime.GOMAXPROCS(0)
+			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, bm.concurrency, cpu)
 			defer cleanup()
 
 			// Create a buffered channel to distribute client connections
-			clientsN := bm.concurrency * runtime.GOMAXPROCS(0)
+			clientsN := bm.concurrency * cpu
 			clientChan := make(chan net.Conn, clientsN)
 			doneChan := make(chan struct{}, clientsN)
 
@@ -372,27 +379,30 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 			b.SetParallelism(bm.concurrency)
 			b.StartTimer()
 
+			response := make([]byte, 4096)
 			b.RunParallel(func(pb *testing.PB) {
 				//b.Logf("bench job start")
 
 				// Get a dedicated client connection for this goroutine
-				var client net.Conn
-				select {
-				case client = <-clientChan:
-				default:
-					b.Fatal("No client available")
-				}
-				response := make([]byte, 4096)
+				// var client net.Conn
+				// select {
+				// case client = <-clientChan:
+				// default:
+				// 	b.Fatal("No client available")
+				// }
+
+				client := <-clientChan
 
 				for pb.Next() {
 					//b.Logf("pb.Next()")
-					if _, err := client.Write(requestBytes); err != nil {
+					_, err := client.Write(requestBytes)
+					if err != nil {
 						b.Error(err)
 						break
 					}
 					//b.Logf("client.Wrote")
 
-					_, err := client.Read(response)
+					_, err = client.Read(response)
 					if err != nil {
 						b.Error(err)
 						break
