@@ -323,7 +323,8 @@ func BenchmarkProxyLinear(b *testing.B) {
 			response := make([]byte, 4096)
 			expectedResponseSize := len(responseTemplate)
 
-			b.SetBytes(int64(len(requestBytes) + expectedResponseSize))
+                        itSize := int64(len(requestBytes) + expectedResponseSize)
+			b.SetBytes(itSize)
 			b.StartTimer()
 
 			for i := 0; i < b.N; i++ {
@@ -381,48 +382,29 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 
 			response := make([]byte, 4096)
 			b.RunParallel(func(pb *testing.PB) {
-				//b.Logf("bench job start")
-
-				// Get a dedicated client connection for this goroutine
-				// var client net.Conn
-				// select {
-				// case client = <-clientChan:
-				// default:
-				// 	b.Fatal("No client available")
-				// }
-
 				client := <-clientChan
 
 				for pb.Next() {
-					//b.Logf("pb.Next()")
 					_, err := client.Write(requestBytes)
 					if err != nil {
 						b.Error(err)
 						break
 					}
-					//b.Logf("client.Wrote")
 
 					_, err = client.Read(response)
 					if err != nil {
 						b.Error(err)
 						break
 					}
-					//b.Log("client.Read")
 				}
-
-				//client.Close()
-				//b.Logf("bench job done")
 
 				// Signal that we're done with this client
 				doneChan <- struct{}{}
 			})
 
-			//b.Logf("job done. waiting for clients...")
-
 			//Wait for all clients to finish
 			for i := 0; i < clientsN; i++ {
 				<-doneChan
-				//b.Logf("done %d/%d", i+1, clientsN)
 			}
 		})
 	}
