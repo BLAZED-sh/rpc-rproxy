@@ -57,7 +57,7 @@ func TestNextObject(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := bytes.NewReader([]byte(tc.input))
-			lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096)
+			lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096, false)
 			_, _ = lexer.Read()
 
 			start, end, err := lexer.NextObject()
@@ -118,7 +118,7 @@ func TestNextObjectErrors(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := bytes.NewReader([]byte(tc.input))
-			lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096)
+			lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096, false)
 			lexer.maxDepth = tc.maxDepth
 			_, _ = lexer.Read()
 
@@ -142,7 +142,7 @@ func TestDecodeAll(t *testing.T) {
 	}
 	input := expected[0] + expected[1] + expected[2]
 	reader := bytes.NewReader([]byte(input))
-	lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096)
+	lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096, false)
 
 	count := 0
 	lexer.DecodeAll(func(b []byte) {
@@ -183,7 +183,7 @@ func TestDecodeAllBig(t *testing.T) {
 	}
 
 	reader := bytes.NewReader([]byte(input))
-	lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096)
+	lexer := NewJsonStreamLexer(context.Background(), reader, 16384, 4096, false)
 
 	lexer.DecodeAll(func(b []byte) {
 		// TODO: check data
@@ -262,7 +262,7 @@ func BenchmarkDecodeAll(b *testing.B) {
 				reader := bytes.NewReader([]byte(input))
 				b.StartTimer()
 
-				lexer := NewJsonStreamLexer(context.Background(), reader, 32768, 16384)
+				lexer := NewJsonStreamLexer(context.Background(), reader, 32768, 16384, false)
 
 				var totalBytes int
 				lexer.DecodeAll(func(data []byte) {

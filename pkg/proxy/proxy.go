@@ -92,6 +92,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		conn,
 		16384,
 		4096,
+		false,
 	)
 
 	upstream, err := j.upstream.NewConn()
@@ -104,13 +105,14 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		upstream,
 		16384,
 		4096,
+		false,
 	)
 
 	j.logger.Trace().Msg("Handling connection")
 
-        /*
-        TODO: The decoder callbacks will block till they are done so make this async in the future
-        */
+	/*
+	   TODO: The decoder callbacks will block till they are done so make this async in the future
+	*/
 	go upstreamDecoder.DecodeAll(func(b []byte) {
 		err := j.handleMessage(b, conn, 1)
 		if err != nil {

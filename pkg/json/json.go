@@ -20,6 +20,8 @@ type JsonStreamLexer struct {
 	cursor int // Points to beginning of next json object
 	length int // Number of bytes used in buffer
 
+	asyncCallbacks bool
+
 	// Parsing policy
 	maxDepth        uint8
 	maxStringLength uint16
@@ -33,6 +35,7 @@ func NewJsonStreamLexer(
 	reader io.Reader,
 	bufferSize int,
 	maxRead int,
+        asyncCallbacks bool,
 ) *JsonStreamLexer {
 	buffer := make([]byte, bufferSize)
 
@@ -41,6 +44,8 @@ func NewJsonStreamLexer(
 		context: context,
 		buffer:  buffer,
 		maxRead: maxRead,
+
+                asyncCallbacks: asyncCallbacks,
 
 		maxDepth:        20,
 		maxStringLength: 9999,
@@ -257,11 +262,15 @@ func (l *JsonStreamLexer) processBuffer(cb func([]byte), errCb func(err error)) 
 			return false // Need more data
 		}
 
-		// TODO: check if this is smart
-		// data := make([]byte, end-start+1)
-		// copy(data, l.buffer[start:end+1])
+		if l.asyncCallbacks {
+			// TODO: check if this is smart
+			data := make([]byte, end-start+1)
+			copy(data, l.buffer[start:end+1])
+			go cb(data)
+		} else {
+			cb(l.buffer[start : end+1])
+		}
 
-		cb(l.buffer[start : end+1])
 		//cb(data)
 		l.cursor = end + 1
 
