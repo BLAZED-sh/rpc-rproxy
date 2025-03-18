@@ -283,3 +283,32 @@ func (l *JsonStreamLexer) processBuffer(cb func([]byte), errCb func(err error)) 
 	}
 	return true
 }
+
+// The following methods are used for debugging
+
+// BufferLength returns the number of bytes used in the buffer
+func (l *JsonStreamLexer) BufferLength() int {
+	return l.length
+}
+
+// Cursor returns the current cursor position
+func (l *JsonStreamLexer) Cursor() int {
+	return l.cursor
+}
+
+// Buffer returns the current buffer
+func (l *JsonStreamLexer) Buffer() []byte {
+	return l.buffer
+}
+
+// BufferContent returns a string representation of the current buffer content
+func (l *JsonStreamLexer) BufferContent() string {
+	if l.length == 0 {
+		return "<empty>"
+	}
+	// Only return up to 100 bytes to avoid huge logs
+	if l.length > 100 {
+		return fmt.Sprintf("%s... (%d more bytes)", string(l.buffer[:100]), l.length-100)
+	}
+	return string(l.buffer[:l.length])
+}
