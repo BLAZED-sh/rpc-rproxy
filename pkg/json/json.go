@@ -24,7 +24,7 @@ type JsonStreamLexer struct {
 
 	// Parsing policy
 	maxDepth        uint8
-	maxStringLength uint16
+	maxStringLength uint32
 	maxArrayLength  uint16
 	maxObjectLength uint16
 }
@@ -35,7 +35,7 @@ func NewJsonStreamLexer(
 	reader io.Reader,
 	bufferSize int,
 	maxRead int,
-        asyncCallbacks bool,
+	asyncCallbacks bool,
 ) *JsonStreamLexer {
 	buffer := make([]byte, bufferSize)
 
@@ -45,10 +45,10 @@ func NewJsonStreamLexer(
 		buffer:  buffer,
 		maxRead: maxRead,
 
-                asyncCallbacks: asyncCallbacks,
+		asyncCallbacks: asyncCallbacks,
 
 		maxDepth:        20,
-		maxStringLength: 9999,
+		maxStringLength: 999999,
 		maxArrayLength:  9999,
 		maxObjectLength: 9999,
 	}
@@ -137,7 +137,7 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 	var (
 		objectDepth  uint8
 		arrayDepth   uint8
-		stringLength uint16
+		stringLength uint32
 		arrayLength  uint16
 		objectLength uint16
 	)
