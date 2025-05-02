@@ -14,8 +14,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// DecoderPair tracks a client connection, upstream connection and their decoders
-type DecoderPair struct {
+type ProxyConn struct {
 	clientConn      net.Conn
 	upstreamConn    net.Conn
 	clientDecoder   *blzdJson.JsonStreamLexer
@@ -26,13 +25,17 @@ type DecoderPair struct {
 type JsonReverseProxy struct {
 	upstream       *Upstream
 	listeners      []net.Listener
-	context        context.Context
-	cancelFunc     context.CancelFunc
 	listening      bool
 	logger         zerolog.Logger
 	asyncCallbacks bool
 	bufferSize     int
 	maxRead        int
+
+	// Optional callbacks for connection events
+	OnConnect    func(id string, conn *ProxyConn)
+	OnDisconnect func(id string, conn *ProxyConn)
+	OnRequest    func(id string, conn *ProxyConn, data []byte)
+	OnResponse   func(id string, conn *ProxyConn, data []byte)
 
 	clientLock   sync.Mutex
 	upstreamLock sync.Mutex
@@ -50,8 +53,6 @@ func (j *JsonReverseProxy) Listen() {
 }
 
 func (j *JsonReverseProxy) Shutdown() {
-	j.cancelFunc()
-
 	// Close all listeners
 	for _, listener := range j.listeners {
 		if err := listener.Close(); err != nil {
@@ -66,30 +67,32 @@ func (j *JsonReverseProxy) Shutdown() {
 func (j *JsonReverseProxy) DumpDebugInfo() {
 	count := 0
 
-	j.logger.Info().Int64("active_connections_count", j.activeConnectionsCount).Msg("Debug information")
+	j.logger.Info().
+		Int64("active_connections_count", j.activeConnectionsCount).
+		Msg("Debug information")
 
 	j.activeConnections.Range(func(key, value interface{}) bool {
 		count++
 		connID := key.(string)
-		pair := value.(*DecoderPair)
+		conn := value.(*ProxyConn)
 
 		// Get client decoder state
 		clientBufferInfo := fmt.Sprintf("Buffer length: %d, cursor: %d, capacity: %d",
-			pair.clientDecoder.BufferLength(),
-			pair.clientDecoder.Cursor(),
-			cap(pair.clientDecoder.Buffer()))
+			conn.clientDecoder.BufferLength(),
+			conn.clientDecoder.Cursor(),
+			cap(conn.clientDecoder.Buffer()))
 
 		// Get client buffer content preview
-		clientBufferContent := pair.clientDecoder.BufferContent()
+		clientBufferContent := conn.clientDecoder.BufferContent()
 
 		// Get upstream decoder state
 		upstreamBufferInfo := fmt.Sprintf("Buffer length: %d, cursor: %d, capacity: %d",
-			pair.upstreamDecoder.BufferLength(),
-			pair.upstreamDecoder.Cursor(),
-			cap(pair.upstreamDecoder.Buffer()))
+			conn.upstreamDecoder.BufferLength(),
+			conn.upstreamDecoder.Cursor(),
+			cap(conn.upstreamDecoder.Buffer()))
 
 		// Get upstream buffer content preview
-		upstreamBufferContent := pair.upstreamDecoder.BufferContent()
+		upstreamBufferContent := conn.upstreamDecoder.BufferContent()
 
 		j.logger.Info().
 			Str("connection_id", connID).
@@ -97,8 +100,8 @@ func (j *JsonReverseProxy) DumpDebugInfo() {
 			Str("client_buffer_content", clientBufferContent).
 			Str("upstream_buffer", upstreamBufferInfo).
 			Str("upstream_buffer_content", upstreamBufferContent).
-			Str("client_remote", pair.clientConn.RemoteAddr().String()).
-			Str("upstream_remote", pair.upstreamConn.RemoteAddr().String()).
+			Str("client_remote", conn.clientConn.RemoteAddr().String()).
+			Str("upstream_remote", conn.upstreamConn.RemoteAddr().String()).
 			Msg("Connection debug info")
 
 		return true
@@ -107,7 +110,13 @@ func (j *JsonReverseProxy) DumpDebugInfo() {
 	j.logger.Info().Int("actual_count", count).Msg("Finished dumping debug info")
 }
 
-func NewUnixUpstreamJsonRpcProxy(path string, asyncCallbacks bool, multiplexing bool, bufferSize int, maxRead int) *JsonReverseProxy {
+func NewUnixUpstreamJsonRpcProxy(
+	path string,
+	asyncCallbacks bool,
+	multiplexing bool,
+	bufferSize int,
+	maxRead int,
+) *JsonReverseProxy {
 	upstream := Upstream{
 		pool:      []net.Conn{},
 		poolSize:  1,
@@ -116,8 +125,6 @@ func NewUnixUpstreamJsonRpcProxy(path string, asyncCallbacks bool, multiplexing 
 			return net.Dial("unix", path)
 		},
 	}
-
-	cancelCtx, cancelFunc := context.WithCancel(context.Background())
 
 	// Initialize a new logger
 	logger := zerolog.New(zerolog.NewConsoleWriter()).
@@ -130,8 +137,6 @@ func NewUnixUpstreamJsonRpcProxy(path string, asyncCallbacks bool, multiplexing 
 	proxy := JsonReverseProxy{
 		upstream:       &upstream,
 		listeners:      []net.Listener{},
-		context:        cancelCtx,
-		cancelFunc:     cancelFunc,
 		listening:      false,
 		logger:         logger,
 		asyncCallbacks: asyncCallbacks,
@@ -193,7 +198,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	)
 
 	// Store connection info for debugging
-	decoderPair := &DecoderPair{
+	decoderPair := &ProxyConn{
 		clientConn:      conn,
 		upstreamConn:    upstream,
 		clientDecoder:   clientDecoder,
@@ -205,21 +210,39 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 
 	j.logger.Trace().Str("connID", connID).Msg("Handling connection")
 
+	// Call the OnConnect callback if set
+	if j.OnConnect != nil {
+		go j.OnConnect(connID, decoderPair)
+	}
+
 	// Clean up function to remove connection from tracking map when done
 	cleanup := func() {
+		if j.OnDisconnect != nil {
+			go j.OnDisconnect(connID, decoderPair)
+		}
+
 		j.activeConnections.Delete(connID)
 		atomic.AddInt64(&j.activeConnectionsCount, -1)
 		j.logger.Trace().Str("connID", connID).Msg("Connection closed")
 	}
 
 	/*
-	   TODO: The decoder callbacks will block till they are done so make this async in the future
+	   TODO: find out why sync deadlocks (upstream is not always read), make async default tho
 	*/
 	go upstreamDecoder.DecodeAll(func(b []byte) {
 		err := j.handleMessage(b, conn, 1)
 		if err != nil {
-			j.logger.Error().Err(err).Str("connID", connID).Msg("Error forwarding upstream message to client")
+			j.logger.Error().
+				Err(err).
+				Str("connID", connID).
+				Msg("Error forwarding upstream message to client")
 		}
+
+		// Call the OnResponse callback if set
+		if j.OnResponse != nil {
+			go j.OnResponse(connID, decoderPair, b)
+		}
+
 	}, func(err error) {
 		j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from upstream")
 		cleanup()
@@ -228,7 +251,14 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	clientDecoder.DecodeAll(func(b []byte) {
 		err := j.handleMessage(b, upstream, 0)
 		if err != nil {
-			j.logger.Error().Err(err).Str("connID", connID).Msg("Error forwarding client message to upstream")
+			j.logger.Error().
+				Err(err).
+				Str("connID", connID).
+				Msg("Error forwarding client message to upstream")
+		}
+
+		if j.OnRequest != nil {
+			go j.OnRequest(connID, decoderPair, b)
 		}
 	}, func(err error) {
 		j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from client")
