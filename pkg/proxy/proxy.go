@@ -60,6 +60,20 @@ func (j *JsonReverseProxy) Shutdown() {
 		}
 	}
 
+	// Close all active connections
+	j.activeConnections.Range(func(key, value interface{}) bool {
+		connID := key.(string)
+		conn := value.(*ProxyConn)
+		if err := conn.clientConn.Close(); err != nil {
+			j.logger.Error().Err(err).Str("connID", connID).Msg("Error closing client connection")
+		}
+		if err := conn.upstreamConn.Close(); err != nil {
+			j.logger.Error().Err(err).Str("connID", connID).Msg("Error closing upstream connection")
+		}
+		j.activeConnections.Delete(key)
+		return true
+	})
+
 	j.logger.Info().Msg("Proxy shutdown complete")
 }
 
