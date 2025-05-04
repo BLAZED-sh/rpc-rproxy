@@ -13,7 +13,6 @@ import (
 // to split the input stream into individual parts that can be parsed by a real JSON decoder.
 type JsonStreamLexer struct {
 	reader  io.Reader
-	context context.Context
 	maxRead int
 
 	buffer []byte
@@ -31,7 +30,6 @@ type JsonStreamLexer struct {
 
 // Create a new JsonStreamLexer with the given reader and buffer size.
 func NewJsonStreamLexer(
-	context context.Context,
 	reader io.Reader,
 	bufferSize int,
 	maxRead int,
@@ -41,7 +39,6 @@ func NewJsonStreamLexer(
 
 	return &JsonStreamLexer{
 		reader:  reader,
-		context: context,
 		buffer:  buffer,
 		maxRead: maxRead,
 
@@ -83,11 +80,11 @@ func (l *JsonStreamLexer) Read() (int, error) {
 	return n, nil
 }
 
-func (l *JsonStreamLexer) DecodeAll(cb func([]byte), errCb func(error)) {
+// Try to read the stream object by object till we hit EOF
+func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), errCb func(error)) {
 	for {
 		select {
-		case <-l.context.Done():
-			return
+		case <-context.Done():
 		default:
 			n, err := l.Read()
 

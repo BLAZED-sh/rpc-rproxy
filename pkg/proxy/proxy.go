@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sync/atomic"
 	"time"
 
@@ -70,7 +71,8 @@ func (j *JsonReverseProxy) Shutdown() {
 		if err := conn.upstreamConn.Close(); err != nil {
 			j.logger.Error().Err(err).Str("connID", connID).Msg("Error closing upstream connection")
 		}
-		j.activeConnections.Delete(key)
+		// TODO: check if the disconnect will trigger eof and through that the cancel function
+		//j.activeConnections.Delete(key)
 		return true
 	})
 
@@ -191,7 +193,6 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	connID := fmt.Sprintf("conn_%d", time.Now().UnixNano())
 
 	clientDecoder := blzdJson.NewJsonStreamLexer(
-		context.Background(),
 		conn,
 		j.bufferSize,
 		j.maxRead,
@@ -204,7 +205,6 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		return
 	}
 	upstreamDecoder := blzdJson.NewJsonStreamLexer(
-		context.Background(),
 		upstream,
 		j.bufferSize,
 		j.maxRead,
@@ -229,27 +229,27 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		go j.OnConnect(connID, decoderPair)
 	}
 
-	// Clean up function to remove connection from tracking map when done
-	cleanup := func() {
-		if j.OnDisconnect != nil {
-			go j.OnDisconnect(connID, decoderPair)
-		}
+	ctx, cancelFn := context.WithCancelCause(context.Background())
 
-		j.activeConnections.Delete(connID)
-		atomic.AddInt64(&j.activeConnectionsCount, -1)
-		j.logger.Trace().Str("connID", connID).Msg("Connection closed")
-	}
+	// TODO: close other side if error happens on one side
 
-	/*
-	   TODO: find out why sync deadlocks (upstream is not always read), make async default tho
-	*/
-	go upstreamDecoder.DecodeAll(func(b []byte) {
+	go upstreamDecoder.DecodeAll(ctx, func(b []byte) {
 		err := j.handleMessage(b, conn, 1)
 		if err != nil {
-			j.logger.Error().
-				Err(err).
-				Str("connID", connID).
-				Msg("Error forwarding upstream message to client")
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				j.logger.Debug().
+					Err(err).
+					Str("connID", connID).
+					Msg("Client->Upstream connection EOF")
+			} else {
+				j.logger.Error().
+					Err(err).
+					Str("connID", connID).
+					Msg("Error forwarding upstream message to client.")
+			}
+
+			cancelFn(err)
+			return
 		}
 
 		// Call the OnResponse callback if set
@@ -259,25 +259,44 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 
 	}, func(err error) {
 		j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from upstream")
-		cleanup()
+		cancelFn(err)
 	})
 
-	clientDecoder.DecodeAll(func(b []byte) {
+	clientDecoder.DecodeAll(ctx, func(b []byte) {
 		err := j.handleMessage(b, upstream, 0)
 		if err != nil {
-			j.logger.Error().
-				Err(err).
-				Str("connID", connID).
-				Msg("Error forwarding client message to upstream")
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				j.logger.Debug().
+					Err(err).
+					Str("connID", connID).
+					Msg("Upstream->Client connection EOF")
+			} else {
+				// TODO: Implement upstream reconnect, maybe resubscribe
+				j.logger.Error().
+					Err(err).
+					Str("connID", connID).
+					Msg("Error forwarding client message to upstream")
+			}
+
+			cancelFn(err)
+			return
 		}
 
 		if j.OnRequest != nil {
 			go j.OnRequest(connID, decoderPair, b)
 		}
 	}, func(err error) {
-		j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from client")
-		cleanup()
+		j.logger.Error().Err(err).Str("connID", connID).Msgf("Error reading from client")
+		cancelFn(err)
 	})
+
+	if j.OnDisconnect != nil {
+		go j.OnDisconnect(connID, decoderPair)
+	}
+
+	j.activeConnections.Delete(connID)
+	atomic.AddInt64(&j.activeConnectionsCount, -1)
+	j.logger.Trace().Str("connID", connID).Msg("Connection closed")
 }
 
 func (j *JsonReverseProxy) handleMessage(data []byte, output net.Conn, logType byte) error {

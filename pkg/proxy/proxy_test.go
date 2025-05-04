@@ -13,18 +13,26 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 )
+
+func init(){
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+}
 
 // Helper function to create temporary Unix socket path
 func getTempSocketPath() string {
 	rndString := fmt.Sprintf("%06x", rand.Intn(0xffffff))
-	return filepath.Join(os.TempDir(), fmt.Sprintf("test-socket-%d-%s.sock", time.Now().UnixNano(), rndString))
+	return filepath.Join(
+		os.TempDir(),
+		fmt.Sprintf("test-socket-%d-%s.sock", time.Now().UnixNano(), rndString),
+	)
 }
 
 func TestNewUnixUpstreamJsonRpcProxy(t *testing.T) {
 	socketPath := getTempSocketPath()
-	proxy := NewUnixUpstreamJsonRpcProxy(socketPath)
+	proxy := NewUnixUpstreamJsonRpcProxy(socketPath, false, false, 4096, 4096)
 
 	assert.NotNil(t, proxy)
 	assert.NotNil(t, proxy.upstream)
@@ -34,7 +42,7 @@ func TestNewUnixUpstreamJsonRpcProxy(t *testing.T) {
 
 func TestAddUnixSocketListener(t *testing.T) {
 	socketPath := getTempSocketPath()
-	proxy := NewUnixUpstreamJsonRpcProxy(socketPath)
+	proxy := NewUnixUpstreamJsonRpcProxy(socketPath, false, false, 4096, 4096)
 
 	listenerPath := getTempSocketPath()
 	err := proxy.AddUnixSocketListener(context.Background(), listenerPath)
@@ -47,7 +55,7 @@ func TestAddUnixSocketListener(t *testing.T) {
 
 func TestListen(t *testing.T) {
 	socketPath := getTempSocketPath()
-	proxy := NewUnixUpstreamJsonRpcProxy(socketPath)
+	proxy := NewUnixUpstreamJsonRpcProxy(socketPath, false, false, 4096, 4096)
 
 	listenerPath := getTempSocketPath()
 	err := proxy.AddUnixSocketListener(context.Background(), listenerPath)
@@ -74,7 +82,7 @@ func TestIntegrationJsonRpcProxy(t *testing.T) {
 	defer os.Remove(proxySocket)
 
 	// Setup proxy
-	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket)
+	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, false, false, 4096, 4096)
 	err = proxy.AddUnixSocketListener(context.Background(), proxySocket)
 	assert.NoError(t, err)
 	proxy.Listen()
@@ -225,7 +233,11 @@ func getMockResponse(method string, id interface{}) []byte {
 }
 
 // setupBenchmark creates all the necessary mock infrastructure for benchmarking
-func setupBenchmark(b *testing.B, method string, concurrency, cpu int) ([]net.Conn, []byte, []byte, func()) {
+func setupBenchmark(
+	b *testing.B,
+	method string,
+	concurrency, cpu int,
+) ([]net.Conn, []byte, []byte, func()) {
 	b.Helper()
 	// Setup mock node
 	upstreamSocket := getTempSocketPath()
@@ -257,7 +269,7 @@ func setupBenchmark(b *testing.B, method string, concurrency, cpu int) ([]net.Co
 
 	// Setup proxy
 	proxySocket := getTempSocketPath()
-	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket)
+	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, false, false, 4096, 4096)
 	err = proxy.AddUnixSocketListener(context.Background(), proxySocket)
 	if err != nil {
 		b.Fatal(err)
@@ -323,7 +335,7 @@ func BenchmarkProxyLinear(b *testing.B) {
 			response := make([]byte, 4096)
 			expectedResponseSize := len(responseTemplate)
 
-                        itSize := int64(len(requestBytes) + expectedResponseSize)
+			itSize := int64(len(requestBytes) + expectedResponseSize)
 			b.SetBytes(itSize)
 			b.StartTimer()
 
@@ -364,7 +376,12 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 			b.StopTimer()
 
 			cpu := runtime.GOMAXPROCS(0)
-			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(b, bm.method, bm.concurrency, cpu)
+			clients, requestBytes, responseTemplate, cleanup := setupBenchmark(
+				b,
+				bm.method,
+				bm.concurrency,
+				cpu,
+			)
 			defer cleanup()
 
 			// Create a buffered channel to distribute client connections
