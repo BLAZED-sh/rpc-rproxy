@@ -43,7 +43,7 @@ type JsonReverseProxy struct {
 
 	// Tracking active connections and decoders for debugging
 	activeConnections      sync.Map // map[string]*DecoderPair
-	activeConnectionsCount int64
+	ActiveConnectionsCount int64
 }
 
 func (j *JsonReverseProxy) Listen() {
@@ -84,7 +84,7 @@ func (j *JsonReverseProxy) DumpDebugInfo() {
 	count := 0
 
 	j.logger.Info().
-		Int64("active_connections_count", j.activeConnectionsCount).
+		Int64("active_connections_count", j.ActiveConnectionsCount).
 		Msg("Debug information")
 
 	j.activeConnections.Range(func(key, value interface{}) bool {
@@ -220,7 +220,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		createdAt:       time.Now().Unix(),
 	}
 	j.activeConnections.Store(connID, decoderPair)
-	atomic.AddInt64(&j.activeConnectionsCount, 1)
+	atomic.AddInt64(&j.ActiveConnectionsCount, 1)
 
 	j.logger.Trace().Str("connID", connID).Msg("Handling connection")
 
@@ -232,7 +232,6 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	ctx, cancelFn := context.WithCancelCause(context.Background())
 
 	// TODO: close other side if error happens on one side
-
 	go upstreamDecoder.DecodeAll(ctx, func(b []byte) {
 		err := j.handleMessage(b, conn, 1)
 		if err != nil {
@@ -256,7 +255,6 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		if j.OnResponse != nil {
 			go j.OnResponse(connID, decoderPair, b)
 		}
-
 	}, func(err error) {
 		j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from upstream")
 		cancelFn(err)
@@ -295,7 +293,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	}
 
 	j.activeConnections.Delete(connID)
-	atomic.AddInt64(&j.activeConnectionsCount, -1)
+	atomic.AddInt64(&j.ActiveConnectionsCount, -1)
 	j.logger.Trace().Str("connID", connID).Msg("Connection closed")
 }
 
