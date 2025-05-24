@@ -82,11 +82,16 @@ func (l *JsonStreamLexer) Read() (int, error) {
 
 // Try to read the stream object by object till we hit EOF
 func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), errCb func(error)) {
+	lastObjComplete := true
 	for {
 		select {
 		case <-context.Done():
 		default:
-			n, err := l.Read()
+			if l.length > 0 && lastObjComplete {
+				lastObjComplete = l.processBuffer(cb, errCb)
+			}
+
+			_, err := l.Read()
 
 			if err == io.EOF {
 				l.processBuffer(cb, errCb)
@@ -99,13 +104,9 @@ func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), er
 				return
 			}
 
-			if n == 0 && err == io.ErrUnexpectedEOF {
-				continue // Try reading again if we need more data
-			}
-
-			// Process available objects and continue if we need more data
-			if complete := l.processBuffer(cb, errCb); complete {
-				return
+			// Reset lastObjComplete if we read new data successfully
+			if !lastObjComplete {
+				lastObjComplete = true
 			}
 		}
 	}
@@ -253,6 +254,7 @@ func (l *JsonStreamLexer) processBuffer(cb func([]byte), errCb func(err error)) 
 		start, end, err := l.NextObject()
 		if err != nil {
 			errCb(err)
+			// TODO: on parsing errors we need to try to skip the invalid part and continue parsing
 			return true // Exit on parsing errors
 		}
 		if end == -1 {
