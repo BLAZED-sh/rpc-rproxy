@@ -91,7 +91,10 @@ func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), er
 				lastObjComplete = l.processBuffer(cb, errCb)
 			}
 
-			_, err := l.Read()
+			n, err := l.Read()
+			if n == 0 && err == nil {
+				continue // No new data, read again
+			}
 
 			if err == io.EOF {
 				l.processBuffer(cb, errCb)
@@ -99,7 +102,7 @@ func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), er
 			}
 
 			// Exit on real errors
-			if err != nil && err != io.ErrUnexpectedEOF {
+			if err != nil {
 				errCb(err)
 				return
 			}
