@@ -83,9 +83,11 @@ func (l *JsonStreamLexer) Read() (int, error) {
 // Try to read the stream object by object till we hit EOF
 func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), errCb func(error)) {
 	lastObjComplete := true
+	done := context.Done()
 	for {
 		select {
-		case <-context.Done():
+		case <-done:
+			break
 		default:
 			if l.length > 0 && lastObjComplete {
 				lastObjComplete = l.processBuffer(cb, errCb)
