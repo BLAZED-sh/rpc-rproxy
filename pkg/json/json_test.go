@@ -80,7 +80,7 @@ func TestNextObjectErrors(t *testing.T) {
 	testCases := []struct {
 		name     string
 		input    string
-		maxDepth uint8
+		maxDepth int
 		wantErr  string
 	}{
 		{
@@ -118,8 +118,9 @@ func TestNextObjectErrors(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := bytes.NewReader([]byte(tc.input))
-			lexer := NewJsonStreamLexer(reader, 16384, 4096, false)
-			lexer.maxDepth = tc.maxDepth
+			limits := DefaultLimits()
+			limits.MaxDepth = tc.maxDepth
+			lexer := NewJsonStreamLexerWithLimits(reader, 16384, 4096, false, limits)
 			_, _ = lexer.Read()
 
 			_, _, err := lexer.NextObject()

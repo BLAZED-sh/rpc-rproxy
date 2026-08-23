@@ -32,6 +32,10 @@ type JsonReverseProxy struct {
 	bufferSize     int
 	maxRead        int
 
+	// JSON decoder limits, upstream is trusted, client could be trying to break stuff
+	ClientLimits   blzdJson.Limits
+	UpstreamLimits blzdJson.Limits
+
 	// Optional callbacks for connection events
 	OnConnect    func(id string, conn *ProxyConn)
 	OnDisconnect func(id string, conn *ProxyConn)
@@ -158,6 +162,9 @@ func NewUnixUpstreamJsonRpcProxy(
 		asyncCallbacks: asyncCallbacks,
 		bufferSize:     bufferSize,
 		maxRead:        maxRead,
+
+		ClientLimits:   blzdJson.StrictLimits(),
+		UpstreamLimits: blzdJson.DefaultLimits(),
 	}
 	return &proxy
 }
@@ -192,11 +199,12 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	// Generate a unique connection ID
 	connID := fmt.Sprintf("conn_%d", time.Now().UnixNano())
 
-	clientDecoder := blzdJson.NewJsonStreamLexer(
+	clientDecoder := blzdJson.NewJsonStreamLexerWithLimits(
 		conn,
 		j.bufferSize,
 		j.maxRead,
 		j.asyncCallbacks,
+		j.ClientLimits,
 	)
 
 	upstream, err := j.upstream.NewConn()
@@ -204,11 +212,12 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		j.logger.Error().Err(err).Msg("Error getting upstream connection")
 		return
 	}
-	upstreamDecoder := blzdJson.NewJsonStreamLexer(
+	upstreamDecoder := blzdJson.NewJsonStreamLexerWithLimits(
 		upstream,
 		j.bufferSize,
 		j.maxRead,
 		j.asyncCallbacks,
+		j.UpstreamLimits,
 	)
 
 	// Store connection info for debugging
