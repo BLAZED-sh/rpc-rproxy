@@ -21,19 +21,32 @@ type JsonStreamLexer struct {
 
 	asyncCallbacks bool
 
-	// Parsing policy
-	maxDepth        uint8
-	maxStringLength uint32
-	maxArrayLength  uint16
-	maxObjectLength uint16
+	// Parsing policy. See Limits; a zero field means unenforced.
+	limits Limits
+
+	// Progress through the object currently being framed. See scanState.
+	scan scanState
 }
 
-// Create a new JsonStreamLexer with the given reader and buffer size.
+// NewJsonStreamLexer creates a lexer using DefaultLimits, which is permissive
+// enough for real Ethereum JSON-RPC responses. Use NewJsonStreamLexerWithLimits
+// to bound untrusted input.
 func NewJsonStreamLexer(
 	reader io.Reader,
 	bufferSize int,
 	maxRead int,
 	asyncCallbacks bool,
+) *JsonStreamLexer {
+	return NewJsonStreamLexerWithLimits(reader, bufferSize, maxRead, asyncCallbacks, DefaultLimits())
+}
+
+// NewJsonStreamLexerWithLimits creates a lexer with explicit parsing limits.
+func NewJsonStreamLexerWithLimits(
+	reader io.Reader,
+	bufferSize int,
+	maxRead int,
+	asyncCallbacks bool,
+	limits Limits,
 ) *JsonStreamLexer {
 	buffer := make([]byte, bufferSize)
 
@@ -44,27 +57,32 @@ func NewJsonStreamLexer(
 
 		asyncCallbacks: asyncCallbacks,
 
-		maxDepth:        20,
-		maxStringLength: 999999,
-		maxArrayLength:  9999,
-		maxObjectLength: 9999,
+		limits: limits,
 	}
 }
 
 func (l *JsonStreamLexer) Read() (int, error) {
-	// Ensure we have room for at least maxRead more data
+	// Refuse to buffer past the object size limit rather than growing until the
+	// process dies. Without this, removing the array and object count caps would
+	// leave nothing bounding memory for a single object.
+	if l.limits.MaxObjectSize > 0 && l.length > l.limits.MaxObjectSize {
+		return 0, fmt.Errorf("object exceeds maximum size of %d bytes", l.limits.MaxObjectSize)
+	}
+
+	// Ensure we have room for at least maxRead more data.
+	//
+	// The condition used to compare remaining capacity against length+maxRead,
+	// which grows the buffer on almost every read once anything is buffered.
+	// What we actually need is room for one more read.
 	bCap := cap(l.buffer)
 	remainingCap := bCap - l.length
-	minCap := l.length + l.maxRead
-	if remainingCap < minCap {
-		var newCap int
-		if bCap < minCap {
+	if remainingCap < l.maxRead {
+		newCap := bCap * 2
+		if minCap := l.length + l.maxRead; newCap < minCap {
 			newCap = minCap
-		} else {
-			newCap = bCap * 2
 		}
 		newBuffer := make([]byte, newCap)
-		copy(newBuffer, l.buffer)
+		copy(newBuffer, l.buffer[:l.length])
 		l.buffer = newBuffer
 	}
 
@@ -87,7 +105,7 @@ func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), er
 	for {
 		select {
 		case <-done:
-			break
+			return
 		default:
 			if l.length > 0 && lastObjComplete {
 				lastObjComplete = l.processBuffer(cb, errCb)
@@ -129,69 +147,87 @@ func init() {
 	isStructural['{'], isStructural['}'], isStructural['['], isStructural[']'], isStructural['"'] = true, true, true, true, true
 }
 
+// scanState carries NextObject's progress between calls
+type scanState struct {
+	active       bool
+	start        int
+	pos          int
+	state        uint8
+	objectDepth  int
+	arrayDepth   int
+	stringLength int
+	arrayCount   int
+	objectCount  int
+}
+
+const (
+	stateInString = 1 << iota
+	stateEscaped
+)
+
+// NextObject returns the bounds of the next complete JSON value in the buffer.
+// An end of -1 means the value is incomplete and more data is needed; progress
+// is retained, so the next call resumes where this one stopped.
 func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
-	const (
-		stateInString = 1 << iota
-		stateEscaped
-	)
-	var state uint8
+	s := &l.scan
 
-	// Use uint8 for depths since JSON rarely nests deeply
-	var (
-		objectDepth  uint8
-		arrayDepth   uint8
-		stringLength uint32
-		arrayLength  uint16
-		objectLength uint16
-	)
-
-	// Find start of object/array
-	buf := l.buffer[l.cursor:l.length]
-	for i := 0; i < len(buf); i++ {
-		c := buf[i]
-		if c == '{' || c == '[' {
-			start = l.cursor + i
-			goto parseLoop
+	if !s.active {
+		// Find the start of the next object or array.
+		for i := l.cursor; i < l.length; i++ {
+			c := l.buffer[i]
+			if c == '{' || c == '[' {
+				*s = scanState{active: true, start: i, pos: i}
+				break
+			}
+			if c == '}' || c == ']' {
+				return 0, 0, fmt.Errorf(
+					"invalid JSON: unmatched closing bracket at position %d",
+					i,
+				)
+			}
+			if !isWhitespace[c] {
+				return 0, 0, fmt.Errorf(
+					"invalid JSON: unexpected character '%c' at position %d",
+					c,
+					i,
+				)
+			}
 		}
-		if c == '}' || c == ']' {
-			return 0, 0, fmt.Errorf(
-				"invalid JSON: unmatched closing bracket at position %d",
-				l.cursor+i,
-			)
-		}
-		if !isWhitespace[c] {
-			return 0, 0, fmt.Errorf(
-				"invalid JSON: unexpected character '%c' at position %d",
-				c,
-				l.cursor+i,
-			)
+		if !s.active {
+			return l.cursor, -1, nil
 		}
 	}
-	return l.cursor, -1, nil
 
-parseLoop:
-	buf = l.buffer[start:l.length]
-	for i := 0; i < len(buf); i++ {
-		c := buf[i]
+	fail := func(format string, args ...any) (int, int, error) {
+		s.active = false
+		return 0, 0, fmt.Errorf(format, args...)
+	}
 
-		if state&stateInString != 0 {
-			stringLength++
-			if stringLength > l.maxStringLength {
-				return 0, 0, fmt.Errorf("string exceeds maximum length of %d", l.maxStringLength)
+	for ; s.pos < l.length; s.pos++ {
+		c := l.buffer[s.pos]
+
+		if l.limits.MaxObjectSize > 0 && s.pos-s.start > l.limits.MaxObjectSize {
+			return fail("object exceeds maximum size of %d bytes", l.limits.MaxObjectSize)
+		}
+
+		if s.state&stateInString != 0 {
+			s.stringLength++
+			if l.limits.MaxStringLength > 0 && s.stringLength > l.limits.MaxStringLength {
+				return fail("string exceeds maximum length of %d", l.limits.MaxStringLength)
 			}
 
-			if state&stateEscaped != 0 {
-				state &^= stateEscaped
+			if s.state&stateEscaped != 0 {
+				s.state &^= stateEscaped
 				continue
 			}
 
 			if c == '\\' {
-				state |= stateEscaped
+				s.state |= stateEscaped
 				continue
 			}
 			if c == '"' {
-				state &^= stateInString
-				stringLength = 0
+				s.state &^= stateInString
+				s.stringLength = 0
 			}
 			continue
 		}
@@ -203,54 +239,52 @@ parseLoop:
 
 		switch c {
 		case '"':
-			state |= stateInString
+			s.state |= stateInString
 		case '{':
-			objectDepth++
-			if objectDepth > l.maxDepth {
-				return 0, 0, fmt.Errorf("object exceeds maximum depth of %d", l.maxDepth)
+			s.objectDepth++
+			if l.limits.MaxDepth > 0 && s.objectDepth > l.limits.MaxDepth {
+				return fail("object exceeds maximum depth of %d", l.limits.MaxDepth)
 			}
 
-			if objectDepth == 1 && arrayDepth == 0 {
-				objectLength++
-				if objectLength > l.maxObjectLength {
-					return 0, 0, fmt.Errorf("object count exceeds maximum of %d", l.maxObjectLength)
+			if s.objectDepth == 1 && s.arrayDepth == 0 {
+				s.objectCount++
+				if l.limits.MaxObjectCount > 0 && s.objectCount > l.limits.MaxObjectCount {
+					return fail("object count exceeds maximum of %d", l.limits.MaxObjectCount)
 				}
 			}
 		case '[':
-			arrayDepth++
-			if arrayDepth > l.maxDepth {
-				return 0, 0, fmt.Errorf("array exceeds maximum depth of %d", l.maxDepth)
+			s.arrayDepth++
+			if l.limits.MaxDepth > 0 && s.arrayDepth > l.limits.MaxDepth {
+				return fail("array exceeds maximum depth of %d", l.limits.MaxDepth)
 			}
-			arrayLength++
-			if arrayLength > l.maxArrayLength {
-				return 0, 0, fmt.Errorf("array length exceeds maximum of %d", l.maxArrayLength)
+			s.arrayCount++
+			if l.limits.MaxArrayCount > 0 && s.arrayCount > l.limits.MaxArrayCount {
+				return fail("array count exceeds maximum of %d", l.limits.MaxArrayCount)
 			}
 		case '}':
-			if objectDepth == 0 {
-				return 0, 0, fmt.Errorf(
-					"invalid JSON: unmatched closing bracket at position %d",
-					start+i,
-				)
+			if s.objectDepth == 0 {
+				return fail("invalid JSON: unmatched closing bracket at position %d", s.pos)
 			}
-			objectDepth--
-			if objectDepth == 0 && arrayDepth == 0 {
-				return start, start + i, nil
+			s.objectDepth--
+			if s.objectDepth == 0 && s.arrayDepth == 0 {
+				st, en := s.start, s.pos
+				*s = scanState{}
+				return st, en, nil
 			}
 		case ']':
-			if arrayDepth == 0 {
-				return 0, 0, fmt.Errorf(
-					"invalid JSON: unmatched closing bracket at position %d",
-					start+i,
-				)
+			if s.arrayDepth == 0 {
+				return fail("invalid JSON: unmatched closing bracket at position %d", s.pos)
 			}
-			arrayDepth--
-			if objectDepth == 0 && arrayDepth == 0 {
-				return start, start + i, nil
+			s.arrayDepth--
+			if s.objectDepth == 0 && s.arrayDepth == 0 {
+				st, en := s.start, s.pos
+				*s = scanState{}
+				return st, en, nil
 			}
 		}
 	}
 
-	return start, -1, nil
+	return s.start, -1, nil
 }
 
 // processBuffer processes complete objects in the buffer and calls the callback for each

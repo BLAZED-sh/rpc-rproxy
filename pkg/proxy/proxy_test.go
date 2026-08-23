@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func init(){
+func init() {
 	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 }
 
@@ -302,6 +302,22 @@ func setupBenchmark(
 		clients[i] = client
 	}
 
+	// Warm every connection with one full round trip before the caller starts
+	// its timer.
+	warmup := make([]byte, len(responseTemplate))
+	for _, client := range clients {
+		if _, err := client.Write(requestBytes); err != nil {
+			b.Fatal(err)
+		}
+		for read := 0; read < len(responseTemplate); {
+			n, err := client.Read(warmup[read:])
+			if err != nil {
+				b.Fatal(err)
+			}
+			read += n
+		}
+	}
+
 	cleanup := func() {
 		for _, client := range clients {
 			client.Close()
@@ -332,8 +348,8 @@ func BenchmarkProxyLinear(b *testing.B) {
 			defer cleanup()
 
 			client := clients[0]
-			response := make([]byte, 4096)
 			expectedResponseSize := len(responseTemplate)
+			response := make([]byte, expectedResponseSize)
 
 			itSize := int64(len(requestBytes) + expectedResponseSize)
 			b.SetBytes(itSize)
@@ -397,9 +413,16 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 			b.SetParallelism(bm.concurrency)
 			b.StartTimer()
 
-			response := make([]byte, 4096)
+			expectedResponseSize := len(responseTemplate)
 			b.RunParallel(func(pb *testing.PB) {
 				client := <-clientChan
+
+				// Claude:
+				// Per-goroutine buffer. This used to be shared across every
+				// parallel goroutine, which is a data race and also let a
+				// partial read leave the connection out of step with the next
+				// iteration.
+				response := make([]byte, expectedResponseSize)
 
 				for pb.Next() {
 					_, err := client.Write(requestBytes)
@@ -408,10 +431,13 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 						break
 					}
 
-					_, err = client.Read(response)
-					if err != nil {
-						b.Error(err)
-						break
+					for read := 0; read < expectedResponseSize; {
+						n, err := client.Read(response[read:])
+						if err != nil {
+							b.Error(err)
+							break
+						}
+						read += n
 					}
 				}
 
