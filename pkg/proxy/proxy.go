@@ -181,6 +181,12 @@ func (j *JsonReverseProxy) AddUnixSocketListener(context context.Context, path s
 	return nil
 }
 
+// AddListener serves an already-constructed listener, for callers whose
+// connections do not arrive from a path of their own.
+func (j *JsonReverseProxy) AddListener(listener net.Listener) {
+	j.listeners = append(j.listeners, listener)
+}
+
 func (j *JsonReverseProxy) acceptConnections(listener net.Listener) {
 	for {
 		conn, err := listener.Accept()
