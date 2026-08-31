@@ -15,6 +15,10 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// How long the upstream gets to finish answering after the client has stopped
+// sending. Bounds a stuck upstream instead of holding the pair open for good.
+const upstreamDrainTimeout = 5 * time.Second
+
 type ProxyConn struct {
 	clientConn      net.Conn
 	upstreamConn    net.Conn
@@ -217,8 +221,17 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	upstream, err := j.upstream.NewConn()
 	if err != nil {
 		j.logger.Error().Err(err).Msg("Error getting upstream connection")
+		conn.Close()
 		return
 	}
+
+	// Both sides close here or they never do: the decoders own no connection and
+	// simply return on EOF, so a client that disconnects would otherwise leave
+	// its fd, its upstream socket and the upstream goroutine behind for good.
+	defer func() {
+		conn.Close()
+		upstream.Close()
+	}()
 	upstreamDecoder := blzdJson.NewJsonStreamLexerWithLimits(
 		upstream,
 		j.bufferSize,
@@ -247,34 +260,37 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 
 	ctx, cancelFn := context.WithCancelCause(context.Background())
 
-	// TODO: close other side if error happens on one side
-	go upstreamDecoder.DecodeAll(ctx, func(b []byte) {
-		err := j.handleMessage(b, conn, 1)
-		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				j.logger.Debug().
-					Err(err).
-					Str("connID", connID).
-					Msg("Client->Upstream connection EOF")
-			} else {
-				j.logger.Error().
-					Err(err).
-					Str("connID", connID).
-					Msg("Error forwarding upstream message to client.")
+	upstreamDone := make(chan struct{})
+	go func() {
+		defer close(upstreamDone)
+		upstreamDecoder.DecodeAll(ctx, func(b []byte) {
+			err := j.handleMessage(b, conn, 1)
+			if err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					j.logger.Debug().
+						Err(err).
+						Str("connID", connID).
+						Msg("Client->Upstream connection EOF")
+				} else {
+					j.logger.Error().
+						Err(err).
+						Str("connID", connID).
+						Msg("Error forwarding upstream message to client.")
+				}
+
+				cancelFn(err)
+				return
 			}
 
+			// Call the OnResponse callback if set
+			if j.OnResponse != nil {
+				go j.OnResponse(connID, decoderPair, b)
+			}
+		}, func(err error) {
+			j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from upstream")
 			cancelFn(err)
-			return
-		}
-
-		// Call the OnResponse callback if set
-		if j.OnResponse != nil {
-			go j.OnResponse(connID, decoderPair, b)
-		}
-	}, func(err error) {
-		j.logger.Error().Err(err).Str("connID", connID).Msg("Error reading from upstream")
-		cancelFn(err)
-	})
+		})
+	}()
 
 	clientDecoder.DecodeAll(ctx, func(b []byte) {
 		err := j.handleMessage(b, upstream, 0)
@@ -303,6 +319,18 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		j.logger.Error().Err(err).Str("connID", connID).Msgf("Error reading from client")
 		cancelFn(err)
 	})
+
+	// The client stopping is not the same as the client being gone: half-closing
+	// and waiting for the answer is a normal pattern. Tell the upstream we are
+	// done writing and let it finish the exchange before the deferred close.
+	if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(upstreamDrainTimeout):
+		j.logger.Warn().Str("connID", connID).Msg("Upstream did not finish draining, closing anyway")
+	}
 
 	if j.OnDisconnect != nil {
 		go j.OnDisconnect(connID, decoderPair)
