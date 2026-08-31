@@ -453,106 +453,120 @@ func BenchmarkProxyConcurrent(b *testing.B) {
 	}
 }
 
-// A client that half-closes and waits for the answer is a normal pattern
-// (socat -t does exactly this), so the client going quiet must not tear the
-// pair down before the upstream has replied.
+// A half-closing client (socat -t) must still get its answer.
 func TestClientHalfCloseStillGetsResponse(t *testing.T) {
-	upstreamSocket := getTempSocketPath()
-	upstreamListener, err := net.Listen("unix", upstreamSocket)
-	assert.NoError(t, err)
-	defer upstreamListener.Close()
-	defer os.Remove(upstreamSocket)
+	forEachCallbackMode(t, func(t *testing.T, async bool) {
+		upstreamSocket := getTempSocketPath()
+		upstreamListener, err := net.Listen("unix", upstreamSocket)
+		assert.NoError(t, err)
+		defer upstreamListener.Close()
+		defer os.Remove(upstreamSocket)
 
-	proxySocket := getTempSocketPath()
-	defer os.Remove(proxySocket)
+		proxySocket := getTempSocketPath()
+		defer os.Remove(proxySocket)
 
-	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, false, false, 4096, 4096)
-	assert.NoError(t, proxy.AddUnixSocketListener(context.Background(), proxySocket))
-	proxy.Listen()
+		proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, async, false, 4096, 4096)
+		assert.NoError(t, proxy.AddUnixSocketListener(context.Background(), proxySocket))
+		proxy.Listen()
 
-	go func() {
-		conn, err := upstreamListener.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
+		go func() {
+			conn, err := upstreamListener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
 
-		buf := make([]byte, 1024)
-		if _, err := conn.Read(buf); err != nil {
-			return
-		}
-		// Answer only after the client has stopped sending.
-		time.Sleep(100 * time.Millisecond)
-		conn.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1234"}` + "\n"))
-	}()
+			buf := make([]byte, 1024)
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+			// Answer only after the client has stopped sending.
+			time.Sleep(100 * time.Millisecond)
+			conn.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1234"}` + "\n"))
+		}()
 
-	client, err := net.Dial("unix", proxySocket)
-	assert.NoError(t, err)
-	defer client.Close()
+		client, err := net.Dial("unix", proxySocket)
+		assert.NoError(t, err)
+		defer client.Close()
 
-	_, err = client.Write([]byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}` + "\n"))
-	assert.NoError(t, err)
-	assert.NoError(t, client.(*net.UnixConn).CloseWrite())
+		_, err = client.Write([]byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}` + "\n"))
+		assert.NoError(t, err)
+		assert.NoError(t, client.(*net.UnixConn).CloseWrite())
 
-	assert.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	response := make([]byte, 1024)
-	n, err := client.Read(response)
-	assert.NoError(t, err)
-	assert.Contains(t, string(response[:n]), "0x1234")
+		assert.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		response := make([]byte, 1024)
+		n, err := client.Read(response)
+		assert.NoError(t, err)
+		assert.Contains(t, string(response[:n]), "0x1234")
+	})
 }
 
-// The decoders own no connection and just return on EOF, so without an explicit
-// close a departed client leaves its fd, its upstream socket and the upstream
-// goroutine behind for good.
+// A departed client must not leave its upstream socket and goroutine behind.
 func TestUpstreamClosesWhenClientLeaves(t *testing.T) {
-	upstreamSocket := getTempSocketPath()
-	upstreamListener, err := net.Listen("unix", upstreamSocket)
-	assert.NoError(t, err)
-	defer upstreamListener.Close()
-	defer os.Remove(upstreamSocket)
+	forEachCallbackMode(t, func(t *testing.T, async bool) {
+		upstreamSocket := getTempSocketPath()
+		upstreamListener, err := net.Listen("unix", upstreamSocket)
+		assert.NoError(t, err)
+		defer upstreamListener.Close()
+		defer os.Remove(upstreamSocket)
 
-	proxySocket := getTempSocketPath()
-	defer os.Remove(proxySocket)
+		proxySocket := getTempSocketPath()
+		defer os.Remove(proxySocket)
 
-	proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, false, false, 4096, 4096)
-	assert.NoError(t, proxy.AddUnixSocketListener(context.Background(), proxySocket))
-	proxy.Listen()
+		proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, async, false, 4096, 4096)
+		assert.NoError(t, proxy.AddUnixSocketListener(context.Background(), proxySocket))
+		proxy.Listen()
 
-	upstreamGone := make(chan struct{})
-	go func() {
-		conn, err := upstreamListener.Accept()
-		if err != nil {
-			return
+		upstreamGone := make(chan struct{})
+		go func() {
+			conn, err := upstreamListener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			buf := make([]byte, 1024)
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
+			conn.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1234"}` + "\n"))
+
+			// Blocks until the proxy lets go of its end.
+			if _, err := conn.Read(buf); err != nil {
+				close(upstreamGone)
+			}
+		}()
+
+		client, err := net.Dial("unix", proxySocket)
+		assert.NoError(t, err)
+
+		_, err = client.Write([]byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}` + "\n"))
+		assert.NoError(t, err)
+
+		assert.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		if _, err := client.Read(make([]byte, 1024)); err != nil {
+			t.Fatalf("no response from the proxy: %v", err)
 		}
-		defer conn.Close()
+		client.Close()
 
-		buf := make([]byte, 1024)
-		if _, err := conn.Read(buf); err != nil {
-			return
+		select {
+		case <-upstreamGone:
+		case <-time.After(upstreamDrainTimeout + 3*time.Second):
+			t.Fatal("the upstream connection outlived the client")
 		}
-		conn.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1234"}` + "\n"))
+	})
+}
 
-		// Blocks until the proxy lets go of its end.
-		if _, err := conn.Read(buf); err != nil {
-			close(upstreamGone)
-		}
-	}()
-
-	client, err := net.Dial("unix", proxySocket)
-	assert.NoError(t, err)
-
-	_, err = client.Write([]byte(`{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}` + "\n"))
-	assert.NoError(t, err)
-
-	assert.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	if _, err := client.Read(make([]byte, 1024)); err != nil {
-		t.Fatalf("no response from the proxy: %v", err)
-	}
-	client.Close()
-
-	select {
-	case <-upstreamGone:
-	case <-time.After(3 * time.Second):
-		t.Fatal("the upstream connection outlived the client")
+// forEachCallbackMode runs a case both ways; production uses async.
+func forEachCallbackMode(t *testing.T, run func(t *testing.T, async bool)) {
+	t.Helper()
+	for _, mode := range []struct {
+		name  string
+		async bool
+	}{
+		{"sync-callbacks", false},
+		{"async-callbacks", true},
+	} {
+		t.Run(mode.name, func(t *testing.T) { run(t, mode.async) })
 	}
 }

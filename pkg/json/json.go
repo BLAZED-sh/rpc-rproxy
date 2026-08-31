@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 )
 
 // JsonStreamLexer is a streaming JSON lexer/seperator that reads JSON objects and arrays from an io.Reader.
@@ -20,6 +21,9 @@ type JsonStreamLexer struct {
 	length int // Number of bytes used in buffer
 
 	asyncCallbacks bool
+
+	// Async callbacks outlive the DecodeAll loop that started them.
+	pending sync.WaitGroup
 
 	// Parsing policy. See Limits; a zero field means unenforced.
 	limits Limits
@@ -133,6 +137,11 @@ func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), er
 			}
 		}
 	}
+}
+
+// WaitCallbacks blocks until every async callback has returned. Call it after DecodeAll.
+func (l *JsonStreamLexer) WaitCallbacks() {
+	l.pending.Wait()
 }
 
 // Pre-computed lookup tables for character classification
@@ -304,7 +313,11 @@ func (l *JsonStreamLexer) processBuffer(cb func([]byte), errCb func(err error)) 
 			// TODO: check if this is smart
 			data := make([]byte, end-start+1)
 			copy(data, l.buffer[start:end+1])
-			go cb(data)
+			l.pending.Add(1)
+			go func() {
+				defer l.pending.Done()
+				cb(data)
+			}()
 		} else {
 			cb(l.buffer[start : end+1])
 		}

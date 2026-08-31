@@ -15,8 +15,7 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// How long the upstream gets to finish answering after the client has stopped
-// sending. Bounds a stuck upstream instead of holding the pair open for good.
+// Grace for the upstream to answer after the client stops sending.
 const upstreamDrainTimeout = 5 * time.Second
 
 type ProxyConn struct {
@@ -225,9 +224,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		return
 	}
 
-	// Both sides close here or they never do: the decoders own no connection and
-	// simply return on EOF, so a client that disconnects would otherwise leave
-	// its fd, its upstream socket and the upstream goroutine behind for good.
+	// The decoders own no connection, so nothing else closes these.
 	defer func() {
 		conn.Close()
 		upstream.Close()
@@ -320,9 +317,12 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		cancelFn(err)
 	})
 
-	// The client stopping is not the same as the client being gone: half-closing
-	// and waiting for the answer is a normal pattern. Tell the upstream we are
-	// done writing and let it finish the exchange before the deferred close.
+	// Async forwards outlive DecodeAll; closing our write side under one EPIPEs it.
+	if !waitFor(clientDecoder.WaitCallbacks, upstreamDrainTimeout) {
+		j.logger.Warn().Str("connID", connID).Msg("Client forwards did not finish, closing anyway")
+	}
+
+	// Half-close and wait for the answer is a normal client pattern.
 	if cw, ok := upstream.(interface{ CloseWrite() error }); ok {
 		_ = cw.CloseWrite()
 	}
@@ -332,6 +332,11 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		j.logger.Warn().Str("connID", connID).Msg("Upstream did not finish draining, closing anyway")
 	}
 
+	// Upstream callbacks write to the client; let them finish first.
+	if !waitFor(upstreamDecoder.WaitCallbacks, upstreamDrainTimeout) {
+		j.logger.Warn().Str("connID", connID).Msg("Client writes did not finish, closing anyway")
+	}
+
 	if j.OnDisconnect != nil {
 		go j.OnDisconnect(connID, decoderPair)
 	}
@@ -339,6 +344,21 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	j.activeConnections.Delete(connID)
 	atomic.AddInt64(&j.ActiveConnectionsCount, -1)
 	j.logger.Trace().Str("connID", connID).Msg("Connection closed")
+}
+
+// waitFor bounds a wait on someone else's goroutine, reporting whether it finished.
+func waitFor(wait func(), timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
 }
 
 func (j *JsonReverseProxy) handleMessage(data []byte, output net.Conn, logType byte) error {
