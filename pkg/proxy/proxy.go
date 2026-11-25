@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,9 @@ import (
 
 // Grace for the upstream to answer after the client stops sending.
 const upstreamDrainTimeout = 5 * time.Second
+
+// Grace for a refused client to read why before the connection closes.
+const refuseTimeout = 2 * time.Second
 
 type ProxyConn struct {
 	clientConn      net.Conn
@@ -289,6 +293,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		})
 	}()
 
+	var clientErr error
 	clientDecoder.DecodeAll(ctx, func(b []byte) {
 		err := j.handleMessage(b, upstream, 0)
 		if err != nil {
@@ -314,6 +319,7 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		}
 	}, func(err error) {
 		j.logger.Error().Err(err).Str("connID", connID).Msgf("Error reading from client")
+		clientErr = err
 		cancelFn(err)
 	})
 
@@ -337,6 +343,12 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 		j.logger.Warn().Str("connID", connID).Msg("Client writes did not finish, closing anyway")
 	}
 
+	// Tell the client why before closing, otherwise bad input looks like a dead
+	// node. Last, so answers to its earlier calls are not cut short.
+	if reply := refusal(clientErr); reply != nil {
+		refuse(conn, reply)
+	}
+
 	if j.OnDisconnect != nil {
 		go j.OnDisconnect(connID, decoderPair)
 	}
@@ -344,6 +356,36 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 	j.activeConnections.Delete(connID)
 	atomic.AddInt64(&j.ActiveConnectionsCount, -1)
 	j.logger.Trace().Str("connID", connID).Msg("Connection closed")
+}
+
+// refusal is the JSON-RPC error for input the lexer rejected, nil for anything else.
+func refusal(err error) []byte {
+	var code int
+	switch {
+	case errors.Is(err, blzdJson.ErrInvalidJSON):
+		code = -32700
+	case errors.Is(err, blzdJson.ErrLimitExceeded):
+		code = -32600
+	default:
+		return nil
+	}
+	msg, _ := json.Marshal(err.Error())
+	return []byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":null,"error":{"code":%d,"message":%s}}`+"\n", code, msg))
+}
+
+// refuse answers, then drains briefly: closing a unix socket with input unread
+// resets the peer before it reads the answer.
+func refuse(conn net.Conn, reply []byte) {
+	if err := conn.SetDeadline(time.Now().Add(refuseTimeout)); err != nil {
+		return
+	}
+	if _, err := conn.Write(reply); err != nil {
+		return
+	}
+	if cw, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+	io.Copy(io.Discard, io.LimitReader(conn, 1<<20))
 }
 
 // waitFor bounds a wait on someone else's goroutine, reporting whether it finished.

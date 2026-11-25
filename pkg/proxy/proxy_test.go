@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net"
 	"os"
@@ -568,5 +569,63 @@ func forEachCallbackMode(t *testing.T, run func(t *testing.T, async bool)) {
 		{"async-callbacks", true},
 	} {
 		t.Run(mode.name, func(t *testing.T) { run(t, mode.async) })
+	}
+}
+
+// Input the lexer refuses must be answered and closed, not left hanging.
+func TestBadClientInputIsRefused(t *testing.T) {
+	cases := []struct {
+		name    string
+		payload string
+		code    string
+	}{
+		{"gibberish", "hello world\n", "-32700"},
+		{"unmatched bracket", "}\n", "-32700"},
+		{"too deep", strings.Repeat("[", 100), "-32600"},
+		{"string too long", `{"a":"` + strings.Repeat("x", 2<<20), "-32600"},
+	}
+	for _, tc := range cases {
+		forEachCallbackMode(t, func(t *testing.T, async bool) {
+			upstreamSocket := getTempSocketPath()
+			upstreamListener, err := net.Listen("unix", upstreamSocket)
+			assert.NoError(t, err)
+			defer upstreamListener.Close()
+			defer os.Remove(upstreamSocket)
+
+			proxySocket := getTempSocketPath()
+			defer os.Remove(proxySocket)
+			proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, async, false, 4096, 4096)
+			assert.NoError(t, proxy.AddUnixSocketListener(context.Background(), proxySocket))
+			proxy.Listen()
+
+			// A node that closes when the proxy does.
+			go func() {
+				conn, err := upstreamListener.Accept()
+				if err != nil {
+					return
+				}
+				io.Copy(io.Discard, conn)
+				conn.Close()
+			}()
+
+			client, err := net.Dial("unix", proxySocket)
+			assert.NoError(t, err)
+			defer client.Close()
+			go client.Write([]byte(tc.payload))
+
+			assert.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+			reply, err := io.ReadAll(client)
+			assert.NoError(t, err, tc.name)
+
+			var parsed struct {
+				Error struct {
+					Code    json.Number `json:"code"`
+					Message string      `json:"message"`
+				} `json:"error"`
+			}
+			assert.NoError(t, json.Unmarshal(reply, &parsed), "%s: reply %q", tc.name, reply)
+			assert.Equal(t, tc.code, parsed.Error.Code.String(), tc.name)
+			assert.NotEmpty(t, parsed.Error.Message, tc.name)
+		})
 	}
 }

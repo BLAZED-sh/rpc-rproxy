@@ -99,13 +99,13 @@ func TestNextObjectErrors(t *testing.T) {
 			name:     "exceeds max depth - nested objects",
 			input:    `{"a": {"b": {"c": {"d": 1}}}}`,
 			maxDepth: 2,
-			wantErr:  "object exceeds maximum depth of 2",
+			wantErr:  "limit exceeded: object exceeds maximum depth of 2",
 		},
 		{
 			name:     "exceeds max depth - nested arrays",
 			input:    `[[[["too deep"]]]]`,
 			maxDepth: 2,
-			wantErr:  "array exceeds maximum depth of 2",
+			wantErr:  "limit exceeded: array exceeds maximum depth of 2",
 		},
 		{
 			name:     "invalid character before object",

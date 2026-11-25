@@ -2,9 +2,16 @@ package json
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
+)
+
+// Why a stream was refused, for callers that answer the peer. Test with errors.Is.
+var (
+	ErrInvalidJSON   = errors.New("invalid JSON")
+	ErrLimitExceeded = errors.New("limit exceeded")
 )
 
 // JsonStreamLexer is a streaming JSON lexer/seperator that reads JSON objects and arrays from an io.Reader.
@@ -70,7 +77,7 @@ func (l *JsonStreamLexer) Read() (int, error) {
 	// process dies. Without this, removing the array and object count caps would
 	// leave nothing bounding memory for a single object.
 	if l.limits.MaxObjectSize > 0 && l.length > l.limits.MaxObjectSize {
-		return 0, fmt.Errorf("object exceeds maximum size of %d bytes", l.limits.MaxObjectSize)
+		return 0, fmt.Errorf("%w: object exceeds maximum size of %d bytes", ErrLimitExceeded, l.limits.MaxObjectSize)
 	}
 
 	// Ensure we have room for at least maxRead more data.
@@ -106,6 +113,15 @@ func (l *JsonStreamLexer) Read() (int, error) {
 func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), errCb func(error)) {
 	lastObjComplete := true
 	done := context.Done()
+
+	// A stream that failed framing cannot be resynchronised; stop instead of
+	// blocking in another read the peer may never satisfy.
+	failed := false
+	report := errCb
+	errCb = func(err error) {
+		failed = true
+		report(err)
+	}
 	for {
 		select {
 		case <-done:
@@ -113,6 +129,9 @@ func (l *JsonStreamLexer) DecodeAll(context context.Context, cb func([]byte), er
 		default:
 			if l.length > 0 && lastObjComplete {
 				lastObjComplete = l.processBuffer(cb, errCb)
+				if failed {
+					return
+				}
 			}
 
 			n, err := l.Read()
@@ -189,17 +208,10 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 				break
 			}
 			if c == '}' || c == ']' {
-				return 0, 0, fmt.Errorf(
-					"invalid JSON: unmatched closing bracket at position %d",
-					i,
-				)
+				return 0, 0, fmt.Errorf("%w: unmatched closing bracket at position %d", ErrInvalidJSON, i)
 			}
 			if !isWhitespace[c] {
-				return 0, 0, fmt.Errorf(
-					"invalid JSON: unexpected character '%c' at position %d",
-					c,
-					i,
-				)
+				return 0, 0, fmt.Errorf("%w: unexpected character %q at position %d", ErrInvalidJSON, c, i)
 			}
 		}
 		if !s.active {
@@ -207,22 +219,22 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 		}
 	}
 
-	fail := func(format string, args ...any) (int, int, error) {
+	fail := func(kind error, format string, args ...any) (int, int, error) {
 		s.active = false
-		return 0, 0, fmt.Errorf(format, args...)
+		return 0, 0, fmt.Errorf("%w: "+format, append([]any{kind}, args...)...)
 	}
 
 	for ; s.pos < l.length; s.pos++ {
 		c := l.buffer[s.pos]
 
 		if l.limits.MaxObjectSize > 0 && s.pos-s.start > l.limits.MaxObjectSize {
-			return fail("object exceeds maximum size of %d bytes", l.limits.MaxObjectSize)
+			return fail(ErrLimitExceeded, "object exceeds maximum size of %d bytes", l.limits.MaxObjectSize)
 		}
 
 		if s.state&stateInString != 0 {
 			s.stringLength++
 			if l.limits.MaxStringLength > 0 && s.stringLength > l.limits.MaxStringLength {
-				return fail("string exceeds maximum length of %d", l.limits.MaxStringLength)
+				return fail(ErrLimitExceeded, "string exceeds maximum length of %d", l.limits.MaxStringLength)
 			}
 
 			if s.state&stateEscaped != 0 {
@@ -252,27 +264,27 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 		case '{':
 			s.objectDepth++
 			if l.limits.MaxDepth > 0 && s.objectDepth > l.limits.MaxDepth {
-				return fail("object exceeds maximum depth of %d", l.limits.MaxDepth)
+				return fail(ErrLimitExceeded, "object exceeds maximum depth of %d", l.limits.MaxDepth)
 			}
 
 			if s.objectDepth == 1 && s.arrayDepth == 0 {
 				s.objectCount++
 				if l.limits.MaxObjectCount > 0 && s.objectCount > l.limits.MaxObjectCount {
-					return fail("object count exceeds maximum of %d", l.limits.MaxObjectCount)
+					return fail(ErrLimitExceeded, "object count exceeds maximum of %d", l.limits.MaxObjectCount)
 				}
 			}
 		case '[':
 			s.arrayDepth++
 			if l.limits.MaxDepth > 0 && s.arrayDepth > l.limits.MaxDepth {
-				return fail("array exceeds maximum depth of %d", l.limits.MaxDepth)
+				return fail(ErrLimitExceeded, "array exceeds maximum depth of %d", l.limits.MaxDepth)
 			}
 			s.arrayCount++
 			if l.limits.MaxArrayCount > 0 && s.arrayCount > l.limits.MaxArrayCount {
-				return fail("array count exceeds maximum of %d", l.limits.MaxArrayCount)
+				return fail(ErrLimitExceeded, "array count exceeds maximum of %d", l.limits.MaxArrayCount)
 			}
 		case '}':
 			if s.objectDepth == 0 {
-				return fail("invalid JSON: unmatched closing bracket at position %d", s.pos)
+				return fail(ErrInvalidJSON, "unmatched closing bracket at position %d", s.pos)
 			}
 			s.objectDepth--
 			if s.objectDepth == 0 && s.arrayDepth == 0 {
@@ -282,7 +294,7 @@ func (l *JsonStreamLexer) NextObject() (start, end int, err error) {
 			}
 		case ']':
 			if s.arrayDepth == 0 {
-				return fail("invalid JSON: unmatched closing bracket at position %d", s.pos)
+				return fail(ErrInvalidJSON, "unmatched closing bracket at position %d", s.pos)
 			}
 			s.arrayDepth--
 			if s.objectDepth == 0 && s.arrayDepth == 0 {
