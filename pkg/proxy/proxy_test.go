@@ -629,3 +629,66 @@ func TestBadClientInputIsRefused(t *testing.T) {
 		})
 	}
 }
+
+// A filtered message is answered by the proxy and never reaches the upstream;
+// the connection stays usable for the next call.
+func TestFilterAnswersInsteadOfForwarding(t *testing.T) {
+	forEachCallbackMode(t, func(t *testing.T, async bool) {
+		upstreamSocket := getTempSocketPath()
+		upstreamListener, err := net.Listen("unix", upstreamSocket)
+		assert.NoError(t, err)
+		defer upstreamListener.Close()
+		defer os.Remove(upstreamSocket)
+
+		proxySocket := getTempSocketPath()
+		defer os.Remove(proxySocket)
+		proxy := NewUnixUpstreamJsonRpcProxy(upstreamSocket, async, false, 4096, 4096)
+		proxy.Filter = func(id string, conn *ProxyConn, data []byte) []byte {
+			if strings.Contains(string(data), "blocked") {
+				return []byte(`{"refused":true}`)
+			}
+			return nil
+		}
+		assert.NoError(t, proxy.AddUnixSocketListener(context.Background(), proxySocket))
+		proxy.Listen()
+
+		seen := make(chan string, 4)
+		go func() {
+			conn, err := upstreamListener.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+			buf := make([]byte, 1024)
+			for {
+				n, err := conn.Read(buf)
+				if err != nil {
+					return
+				}
+				seen <- string(buf[:n])
+				conn.Write([]byte(`{"result":"0x1"}` + "\n"))
+			}
+		}()
+
+		client, err := net.Dial("unix", proxySocket)
+		assert.NoError(t, err)
+		defer client.Close()
+		assert.NoError(t, client.SetDeadline(time.Now().Add(3*time.Second)))
+		buf := make([]byte, 1024)
+
+		_, err = client.Write([]byte(`{"method":"blocked"}` + "\n"))
+		assert.NoError(t, err)
+		n, err := client.Read(buf)
+		assert.NoError(t, err)
+		assert.Contains(t, string(buf[:n]), "refused")
+
+		_, err = client.Write([]byte(`{"method":"fine"}` + "\n"))
+		assert.NoError(t, err)
+		n, err = client.Read(buf)
+		assert.NoError(t, err)
+		assert.Contains(t, string(buf[:n]), "0x1")
+
+		assert.Contains(t, <-seen, "fine")
+		assert.Empty(t, seen)
+	})
+}

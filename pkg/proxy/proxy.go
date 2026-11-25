@@ -43,6 +43,11 @@ type JsonReverseProxy struct {
 	ClientLimits   blzdJson.Limits
 	UpstreamLimits blzdJson.Limits
 
+	// Filter, if set, sees every client message before it is forwarded. A
+	// non-nil return is sent to the client instead and the message never
+	// reaches the upstream. It runs on the forwarding path, so keep it cheap.
+	Filter func(id string, conn *ProxyConn, data []byte) (reply []byte)
+
 	// Optional callbacks for connection events
 	OnConnect    func(id string, conn *ProxyConn)
 	OnDisconnect func(id string, conn *ProxyConn)
@@ -295,6 +300,15 @@ func (j *JsonReverseProxy) handleConnection(conn net.Conn) {
 
 	var clientErr error
 	clientDecoder.DecodeAll(ctx, func(b []byte) {
+		if j.Filter != nil {
+			if reply := j.Filter(connID, decoderPair, b); reply != nil {
+				if err := j.handleMessage(reply, conn, 1); err != nil {
+					cancelFn(err)
+				}
+				return
+			}
+		}
+
 		err := j.handleMessage(b, upstream, 0)
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
